@@ -3,13 +3,15 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v7.1';
+const VERSION = 'v8';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID;
-const CONTRACT = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
+const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID;
+const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
+const SC1_TARGET    = parseInt(process.env.SC1_TARGET || '200');
+const SC5_TARGET    = parseInt(process.env.SC5_TARGET || '100');
 
 if (!TELEGRAM_TOKEN) { console.error('TELEGRAM_BOT_TOKEN eksik!'); process.exit(1); }
-if (!CHANNEL_ID) console.warn('[WARN] TELEGRAM_CHANNEL_ID ayarlı değil — otomatik bildirim kapalı');
+if (!CHANNEL_ID) console.warn('[WARN] TELEGRAM_CHANNEL_ID ayarlı değil');
 
 const CONTRACT_LOWER = CONTRACT.toLowerCase();
 
@@ -23,7 +25,15 @@ const RPCS = [
   'https://base.blockscout.com/api/eth-rpc',
 ].filter(Boolean);
 
-// Known claim() function selectors
+// Tier config: name + emoji. Tier decoded from calldata field #1 (uint8).
+const TIER_INFO = {
+  1: { name: 'opal', emoji: '💎', nominalUsd: 1 },
+  2: { name: 'jade', emoji: '🎱', nominalUsd: 5 },
+};
+function getTierInfo(t) {
+  return TIER_INFO[t] || { name: `tier${t}`, emoji: '📦', nominalUsd: t };
+}
+
 const CLAIM_SELECTORS = new Set([
   '0x4e71d92d', // claim()
   '0x379607f5', // claim(uint256)
@@ -33,33 +43,50 @@ const CLAIM_SELECTORS = new Set([
   '0xbd66528a', // scratch()
   '0xdb006a75', // redeem()
   '0x96c55175', // claim(uint256,address)
-  '0x7d49ec34', // claim(uint256,bytes32[])
   '0xae169a50', // claimReward(uint256)
 ]);
 
-const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
-const CHAINLINK_ETHUSD = '0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70';
-const WETH  = '0x4200000000000000000000000000000000000006';
-const USDC  = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
-const UNI_FACTORY  = '0x33128a8fC17869897dcE68Ed026d694621f6FDfD';
-const AERO_FACTORY = '0x420DD381b31aEf6683db6B902084cB0FFECe40Da';
+// claim(uint64 batchId, uint8 tier, uint256 seed, uint256 nonce, uint256 deadline)
+// calldata = 0x(8) + batchId(64) + tier(64) + seed(64) + nonce(64) + deadline(64) = 330 chars
+function isClaimInput(data) {
+  if (!data || data.length < 10) return false;
+  if (CLAIM_SELECTORS.has(data.slice(0, 10).toLowerCase())) return true;
+  if (data.length === 330) return true; // 5-param variant
+  return false;
+}
 
-// ─── State ───────────────────────────────────────────────────────────────────
-let claimHistory = [];
+function decodeTier(data) {
+  if (!data || data.length !== 330) return null;
+  // tier is 2nd ABI param: offset 10 (selector) + 64 (batchId) = 74
+  const t = parseInt(data.slice(74, 138), 16);
+  return (t >= 1 && t <= 20) ? t : null;
+}
+
+const TRANSFER_TOPIC  = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+const CHAINLINK_ETHUSD = '0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70';
+const WETH             = '0x4200000000000000000000000000000000000006';
+const USDC             = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
+const UNI_FACTORY      = '0x33128a8fC17869897dcE68Ed026d694621f6FDfD';
+const AERO_FACTORY     = '0x420DD381b31aEf6683db6B902084cB0FFECe40Da';
 const CYCLE_SIZE = 50;
-let claimCount = 0;
-let streak = 0;
-let streakDir = null;
+
+// ─ Per-tier state ─────────────────────────────────────────────────────────────────────────
+const tierStates = {};
+function ts(tier) {
+  if (!tierStates[tier])
+    tierStates[tier] = { history: [], count: 0, streak: 0, streakDir: null };
+  return tierStates[tier];
+}
+
 let processedTxs = new Set();
 let pollingErrCount = 0;
-
 let provider, bot;
 let tokenInfoCache = {};
 let priceCache = {};
 let ethPrice = 0, ethPriceAt = 0;
 let lastPollBlock = 0;
 
-// ─── Provider ────────────────────────────────────────────────────────────────
+// ─ RPC ──────────────────────────────────────────────────────────────────────────────
 async function getProvider() {
   for (const rpc of RPCS) {
     try {
@@ -70,9 +97,7 @@ async function getProvider() {
       ]);
       console.log(`[RPC ✓] ${rpc}`);
       return p;
-    } catch (e) {
-      console.log(`[RPC ✗] ${e.message.slice(0, 80)}`);
-    }
+    } catch (e) { console.log(`[RPC ✗] ${e.message.slice(0, 70)}`); }
   }
   throw new Error('Hiçbir RPC bağlanamadı');
 }
@@ -80,11 +105,8 @@ async function getProvider() {
 async function getEthUsd() {
   if (Date.now() - ethPriceAt < 60_000 && ethPrice > 0) return ethPrice;
   try {
-    const cl = new ethers.Contract(
-      CHAINLINK_ETHUSD,
-      ['function latestAnswer() view returns (int256)'],
-      provider
-    );
+    const cl = new ethers.Contract(CHAINLINK_ETHUSD,
+      ['function latestAnswer() view returns (int256)'], provider);
     ethPrice = Number(await cl.latestAnswer()) / 1e8;
     ethPriceAt = Date.now();
   } catch (_) { if (!ethPrice) ethPrice = 3000; }
@@ -96,22 +118,14 @@ async function getTokenInfo(address) {
   if (tokenInfoCache[k]) return tokenInfoCache[k];
   let symbol = '???', decimals = 18;
   try {
-    const r = await axios.get(
-      `https://base.blockscout.com/api/v2/tokens/${address}`,
-      { timeout: 6000 }
-    );
+    const r = await axios.get(`https://base.blockscout.com/api/v2/tokens/${address}`, { timeout: 6000 });
     if (r.data?.symbol) {
-      symbol = r.data.symbol;
-      decimals = parseInt(r.data.decimals ?? 18);
-      tokenInfoCache[k] = { symbol, decimals };
-      return tokenInfoCache[k];
+      symbol = r.data.symbol; decimals = parseInt(r.data.decimals ?? 18);
+      tokenInfoCache[k] = { symbol, decimals }; return tokenInfoCache[k];
     }
   } catch (_) {}
-  const c = new ethers.Contract(
-    address,
-    ['function symbol() view returns (string)', 'function decimals() view returns (uint8)'],
-    provider
-  );
+  const c = new ethers.Contract(address,
+    ['function symbol() view returns (string)', 'function decimals() view returns (uint8)'], provider);
   try { symbol   = await c.symbol(); } catch (_) {}
   try { decimals = Number(await c.decimals()); } catch (_) {}
   tokenInfoCache[k] = { symbol, decimals };
@@ -122,54 +136,38 @@ async function getTokenPriceUsd(address) {
   const k = address.toLowerCase();
   const cached = priceCache[k];
   if (cached && Date.now() - cached.at < 60_000) return cached.price;
-
   const { decimals } = await getTokenInfo(address);
 
-  // Uniswap V3
-  const uniFactory = new ethers.Contract(
-    UNI_FACTORY,
-    ['function getPool(address,address,uint24) view returns (address)'],
-    provider
-  );
+  const uniFactory = new ethers.Contract(UNI_FACTORY,
+    ['function getPool(address,address,uint24) view returns (address)'], provider);
   for (const [quote, qDec, isEth] of [[WETH, 18, true], [USDC, 6, false]]) {
     for (const fee of [100, 500, 3000, 10000]) {
       try {
-        const poolAddr = await uniFactory.getPool(address, quote, fee);
-        if (!poolAddr || poolAddr === ethers.ZeroAddress) continue;
-        const pool = new ethers.Contract(poolAddr, [
+        const pa = await uniFactory.getPool(address, quote, fee);
+        if (!pa || pa === ethers.ZeroAddress) continue;
+        const pool = new ethers.Contract(pa, [
           'function slot0() view returns (uint160,int24,uint16,uint16,uint16,uint8,bool)',
           'function token0() view returns (address)',
         ], provider);
         const [s, t0] = await Promise.all([pool.slot0(), pool.token0()]);
         const isT0 = t0.toLowerCase() === k;
-        const sq = Number(s[0]) / 2 ** 96;
-        const pr = sq * sq;
-        const priceInQuote = isT0
-          ? pr * (10 ** qDec) / (10 ** decimals)
-          : (1 / pr) * (10 ** decimals) / (10 ** qDec);
-        const priceUsd = isEth ? priceInQuote * await getEthUsd() : priceInQuote;
-        if (priceUsd > 0 && priceUsd < 1e12) {
-          priceCache[k] = { price: priceUsd, at: Date.now() };
-          console.log(`[PRICE] UniV3 $${priceUsd.toExponential(4)}`);
-          return priceUsd;
-        }
+        const sq = Number(s[0]) / 2 ** 96, pr = sq * sq;
+        const piq = isT0 ? pr * (10**qDec) / (10**decimals) : (1/pr) * (10**decimals) / (10**qDec);
+        const pusd = isEth ? piq * await getEthUsd() : piq;
+        if (pusd > 0 && pusd < 1e12) { priceCache[k] = { price: pusd, at: Date.now() }; return pusd; }
       } catch (_) {}
     }
   }
 
-  // Aerodrome V2
   try {
-    const aeroFactory = new ethers.Contract(
-      AERO_FACTORY,
-      ['function getPair(address,address,bool) view returns (address)'],
-      provider
-    );
+    const af = new ethers.Contract(AERO_FACTORY,
+      ['function getPair(address,address,bool) view returns (address)'], provider);
     for (const [quote, qDec, isEth] of [[WETH, 18, true], [USDC, 6, false]]) {
       for (const stable of [false, true]) {
         try {
-          const pairAddr = await aeroFactory.getPair(address, quote, stable);
-          if (!pairAddr || pairAddr === ethers.ZeroAddress) continue;
-          const pair = new ethers.Contract(pairAddr, [
+          const pa = await af.getPair(address, quote, stable);
+          if (!pa || pa === ethers.ZeroAddress) continue;
+          const pair = new ethers.Contract(pa, [
             'function getReserves() view returns (uint112,uint112,uint32)',
             'function token0() view returns (address)',
           ], provider);
@@ -178,69 +176,45 @@ async function getTokenPriceUsd(address) {
           const tokR = Number(ethers.formatUnits(isT0 ? res[0] : res[1], decimals));
           const quoR = Number(ethers.formatUnits(isT0 ? res[1] : res[0], qDec));
           if (tokR <= 0 || quoR <= 0) continue;
-          const priceUsd = isEth
-            ? (quoR / tokR) * await getEthUsd()
-            : quoR / tokR;
-          if (priceUsd > 0 && priceUsd < 1e12) {
-            priceCache[k] = { price: priceUsd, at: Date.now() };
-            console.log(`[PRICE] Aerodrome $${priceUsd.toExponential(4)}`);
-            return priceUsd;
-          }
+          const pusd = isEth ? (quoR/tokR) * await getEthUsd() : quoR/tokR;
+          if (pusd > 0 && pusd < 1e12) { priceCache[k] = { price: pusd, at: Date.now() }; return pusd; }
         } catch (_) {}
       }
     }
   } catch (_) {}
 
-  // DexScreener fallback
   try {
-    const r = await axios.get(
-      `https://api.dexscreener.com/latest/dex/tokens/${address}`,
-      { timeout: 8000 }
-    );
+    const r = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${address}`, { timeout: 8000 });
     const pairs = (r.data?.pairs || []).filter(p => p.chainId === 'base');
     if (pairs.length) {
       const price = parseFloat(pairs[0].priceUsd);
-      if (price > 0) {
-        priceCache[k] = { price, at: Date.now() };
-        console.log(`[PRICE] DexScreener $${price.toExponential(4)}`);
-        return price;
-      }
+      if (price > 0) { priceCache[k] = { price, at: Date.now() }; return price; }
     }
   } catch (_) {}
 
-  console.warn(`[PRICE] ${address.slice(0, 10)}... için fiyat bulunamadı`);
   return null;
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─ Core: process one claim TX ─────────────────────────────────────────────────────────
 function calcAvg(arr, n) {
   if (arr.length < n) return null;
   return arr.slice(0, n).reduce((s, v) => s + v.usd, 0) / n;
 }
 
-function isClaimInput(data) {
-  if (!data || data.length < 10) return false;
-  return CLAIM_SELECTORS.has(data.slice(0, 10).toLowerCase());
-}
-
-// ─── Process one claim TX ───────────────────────────────────────────────────
 async function processClaimTx(txHash, from, data, blockNum, blockTs) {
   if (processedTxs.has(txHash)) return;
   processedTxs.add(txHash);
   if (processedTxs.size > 20000) {
-    const arr = [...processedTxs];
-    processedTxs = new Set(arr.slice(-10000));
+    const arr = [...processedTxs]; processedTxs = new Set(arr.slice(-10000));
   }
 
   let receipt;
-  try {
-    receipt = await provider.getTransactionReceipt(txHash);
-  } catch (_) { return; }
+  try { receipt = await provider.getTransactionReceipt(txHash); } catch (_) { return; }
   if (!receipt || receipt.status === 0) return;
 
   const claimer = from.toLowerCase();
 
-  // ERC20 transfers TO claimer
+  // Collect ERC20 transfers TO claimer
   const received = {};
   for (const log of receipt.logs) {
     if (log.topics[0]?.toLowerCase() !== TRANSFER_TOPIC) continue;
@@ -253,11 +227,10 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
   }
 
   if (!Object.keys(received).length) {
-    console.log(`[SKIP ${txHash.slice(0, 10)}] alıcıya transfer yok`);
-    return;
+    console.log(`[SKIP ${txHash.slice(0,10)}] transfer yok`); return;
   }
 
-  // Pick best (highest USD) token
+  // Pick highest-USD token
   let bestUsd = 0, bestToken = null;
   for (const [addr, rawAmt] of Object.entries(received)) {
     try {
@@ -271,81 +244,78 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
   }
 
   if (!bestToken || bestUsd <= 0) {
-    console.log(`[SKIP ${txHash.slice(0, 10)}] fiyat bulunamadı`);
-    return;
+    console.log(`[SKIP ${txHash.slice(0,10)}] fiyat yok`); return;
   }
 
-  const packetType = bestUsd >= 2.5 ? '$5' : '$1';
+  // Tier from calldata; fallback to nominal threshold
+  const tier     = decodeTier(data) ?? (bestUsd >= 2.5 ? 2 : 1);
+  const tierInfo = getTierInfo(tier);
+  const state    = ts(tier);
 
-  if (claimHistory.length > 0) {
-    const dir = bestUsd >= claimHistory[0].usd ? 'up' : 'down';
-    streak    = dir === streakDir ? streak + 1 : 1;
-    streakDir = dir;
+  // Streak (per tier, red = down, green = up)
+  if (state.history.length > 0) {
+    const dir = bestUsd >= state.history[0].usd ? 'up' : 'down';
+    state.streak    = dir === state.streakDir ? state.streak + 1 : 1;
+    state.streakDir = dir;
   } else {
-    streak = 1; streakDir = null;
+    state.streak = 1; state.streakDir = null;
   }
 
-  claimCount++;
-  claimHistory.unshift({ usd: bestUsd, ts: blockTs * 1000, hash: txHash, claimer: from });
-  if (claimHistory.length > 200) claimHistory.pop();
+  state.count++;
+  state.history.unshift({ usd: bestUsd, ts: blockTs * 1000, hash: txHash, claimer: from });
+  if (state.history.length > 200) state.history.pop();
 
-  const posInCycle = ((claimCount - 1) % CYCLE_SIZE) + 1;
+  const posInCycle = ((state.count - 1) % CYCLE_SIZE) + 1;
   const remaining  = CYCLE_SIZE - posInCycle;
-  const cycleAvg   = claimHistory.slice(0, posInCycle).reduce((s, c) => s + c.usd, 0) / posInCycle;
+  const cycleAvg   = state.history.slice(0, posInCycle).reduce((s, c) => s + c.usd, 0) / posInCycle;
 
   const avgLine = [5, 10, 15, 20, 50, 100]
-    .map(n => { const v = calcAvg(claimHistory, n); return v !== null ? `Avg${n} $${v.toFixed(2)}` : null; })
-    .filter(Boolean)
-    .join(' | ');
+    .map(n => { const v = calcAvg(state.history, n); return v !== null ? `Avg${n} $${v.toFixed(2)}` : null; })
+    .filter(Boolean).join(' | ');
 
-  const sEmoji = streakDir === 'up' ? '🔺' : '🔻';
+  const sEmoji = state.streakDir === 'down' ? '🔴' : '🟢';
   const date   = new Date(blockTs * 1000).toISOString().replace('T', ' ').slice(0, 19) + 'Z';
   const txUrl  = `https://basescan.org/tx/${txHash}`;
 
   const msg = [
-    `Total Value: $${bestUsd.toFixed(2)} [${packetType}]`,
+    `${tierInfo.emoji} Total Value: $${bestUsd.toFixed(2)} [${tierInfo.name}]`,
     `📍 Döngü: ${posInCycle}/${CYCLE_SIZE} (~${remaining} kaldı) — Döngü Avg: $${cycleAvg.toFixed(2)}`,
-    `${sEmoji} Streak: ${streak}`,
+    `${sEmoji} Streak: ${state.streak}`,
     avgLine ? `📊 ${avgLine}` : null,
     `👤 ${from}`,
     `🕐 ${date} | <a href="${txUrl}">TX</a>`,
   ].filter(Boolean).join('\n');
 
-  console.log(`[✓] $${bestUsd.toFixed(2)} [${packetType}] cycle=${posInCycle}/${CYCLE_SIZE} streak=${streak} | ${txHash.slice(0, 10)}`);
+  console.log(`[✓] tier${tier}(${tierInfo.name}) $${bestUsd.toFixed(2)} cycle=${posInCycle}/${CYCLE_SIZE} streak=${state.streak} | ${txHash.slice(0,10)}`);
 
   if (CHANNEL_ID) {
     try {
-      await bot.sendMessage(CHANNEL_ID, msg, {
-        parse_mode: 'HTML',
-        disable_web_page_preview: true,
-      });
+      await bot.sendMessage(CHANNEL_ID, msg, { parse_mode: 'HTML', disable_web_page_preview: true });
     } catch (e) { console.error('[TG]', e.message); }
   }
 }
 
-// ─── Block scanning (primary live strategy) ─────────────────────────────────────────
-async function scanBlocksForClaimTxs(fromBlock, toBlock) {
+// ─ Block scanner ──────────────────────────────────────────────────────────────────────
+async function scanBlocks(fromBlock, toBlock) {
   const found = [];
   const BATCH = 8;
   for (let b = fromBlock; b <= toBlock; b += BATCH) {
     const end = Math.min(b + BATCH - 1, toBlock);
-    const promises = [];
-    for (let i = b; i <= end; i++) {
-      promises.push(provider.getBlock(i, true).catch(() => null));
-    }
-    const blocks = await Promise.all(promises);
+    const blocks = await Promise.all(
+      Array.from({ length: end - b + 1 }, (_, i) =>
+        provider.getBlock(b + i, true).catch(() => null)
+      )
+    );
     for (const block of blocks) {
       if (!block) continue;
-      const txs = block.prefetchedTransactions || [];
-      for (const tx of txs) {
+      for (const tx of (block.prefetchedTransactions || [])) {
         if (tx.to?.toLowerCase() !== CONTRACT_LOWER) continue;
         if (!isClaimInput(tx.data || tx.input || '')) continue;
         found.push({
-          hash: tx.hash,
-          from: tx.from,
+          hash: tx.hash, from: tx.from,
           data: tx.data || tx.input,
           blockNum: Number(block.number),
-          blockTs: Number(block.timestamp),
+          blockTs:  Number(block.timestamp),
         });
       }
     }
@@ -353,111 +323,133 @@ async function scanBlocksForClaimTxs(fromBlock, toBlock) {
   return found;
 }
 
-// ─── Blockscout API history loader ────────────────────────────────────────────────
-async function loadHistoryViaBlockscout(limit = 150) {
-  console.log('[HISTORY] Blockscout API ile yükleniyor...');
+// ─ Blockscout history loader ────────────────────────────────────────────────────────
+async function loadHistory() {
+  console.log('[HISTORY] Blockscout API...');
   try {
     const r = await axios.get(
       `https://base.blockscout.com/api/v2/addresses/${CONTRACT}/transactions`,
       { params: { filter: 'to' }, timeout: 15000 }
     );
     const items = r.data?.items || [];
-    console.log(`[HISTORY] Blockscout: ${items.length} TX döndü`);
+    console.log(`[HISTORY] ${items.length} TX`);
 
     const claimTxs = items
       .filter(tx => {
-        const sel = (tx.raw_input || '').slice(0, 10).toLowerCase();
-        return tx.status === 'ok' && CLAIM_SELECTORS.has(sel);
+        if (tx.status !== 'ok') return false;
+        const method = (tx.method || '').toLowerCase();
+        if (method.includes('claim') || method.includes('redeem') || method.includes('scratch')) return true;
+        const raw = tx.raw_input || '';
+        return CLAIM_SELECTORS.has(raw.slice(0, 10).toLowerCase()) || raw.length === 330;
       })
       .sort((a, b) => a.block - b.block);
 
-    console.log(`[HISTORY] ${claimTxs.length} claim TX işlenecek`);
-
-    for (const tx of claimTxs.slice(0, limit)) {
+    console.log(`[HISTORY] ${claimTxs.length} claim TX`);
+    for (const tx of claimTxs) {
       try {
-        const blockTs = Math.floor(new Date(tx.timestamp).getTime() / 1000);
+        const blockTs  = Math.floor(new Date(tx.timestamp).getTime() / 1000);
         const fromAddr = tx.from?.hash || tx.from;
         if (!fromAddr) continue;
-        await processClaimTx(tx.hash, fromAddr, tx.raw_input, tx.block, blockTs);
+        await processClaimTx(tx.hash, fromAddr, tx.raw_input || '', tx.block, blockTs);
       } catch (e) { console.error('[HISTORY tx]', e.message); }
     }
-  } catch (e) {
-    console.error('[HISTORY] Blockscout API hatası:', e.message);
-  }
+  } catch (e) { console.error('[HISTORY]', e.message); }
 }
 
-// ─── Live poll loop ───────────────────────────────────────────────────────────
+// ─ Poll loop ───────────────────────────────────────────────────────────────────────
 async function pollLoop() {
   let fails = 0;
   console.log('[POLL] Canlı izleme başlıyor...');
-
   while (true) {
     try {
       const cur = await provider.getBlockNumber();
       if (lastPollBlock === 0) lastPollBlock = cur - 1;
-
       if (cur > lastPollBlock) {
-        const fromB = lastPollBlock + 1;
-        const toB   = Math.min(cur, lastPollBlock + 20);
-
-        const txs = await scanBlocksForClaimTxs(fromB, toB);
+        const from = lastPollBlock + 1;
+        const to   = Math.min(cur, lastPollBlock + 20);
+        const txs  = await scanBlocks(from, to);
         for (const tx of txs) {
-          if (processedTxs.has(tx.hash)) continue;
-          await processClaimTx(tx.hash, tx.from, tx.data, tx.blockNum, tx.blockTs);
+          if (!processedTxs.has(tx.hash))
+            await processClaimTx(tx.hash, tx.from, tx.data, tx.blockNum, tx.blockTs);
         }
-
-        lastPollBlock = toB;
+        lastPollBlock = to;
       }
-
       fails = 0;
       await new Promise(r => setTimeout(r, 2500));
     } catch (e) {
       fails++;
       console.error('[POLL]', e.message.slice(0, 80));
-      if (fails >= 5) {
-        try { provider = await getProvider(); fails = 0; } catch (_) {}
-      }
+      if (fails >= 5) { try { provider = await getProvider(); fails = 0; } catch (_) {} }
       await new Promise(r => setTimeout(r, Math.min(fails * 3000, 30000)));
     }
   }
 }
 
-// ─── Telegram status ─────────────────────────────────────────────────────────────────
-function buildStatusMsg() {
-  if (!claimHistory.length)
-    return `⏳ Henüz claim kaydı yok.\nContract: ${CONTRACT}\nVersion: ${VERSION}`;
+// ─ Telegram messages ──────────────────────────────────────────────────────────────────
+function overallAvg(tierNum) {
+  const h = (tierStates[tierNum] || {}).history || [];
+  if (!h.length) return null;
+  return h.reduce((s, c) => s + c.usd, 0) / h.length;
+}
 
-  const posInCycle = ((claimCount - 1) % CYCLE_SIZE) + 1;
-  const cycleAvg   = claimHistory.slice(0, posInCycle).reduce((s, c) => s + c.usd, 0) / posInCycle;
-  const sEmoji     = streakDir === 'up' ? '🔺' : '🔻';
-
-  const avgLines = [5, 10, 15, 20, 50, 100]
-    .map(n => { const v = calcAvg(claimHistory, n); return v !== null ? `Avg${n}: $${v.toFixed(2)}` : null; })
-    .filter(Boolean).join('\n');
-
-  const last = claimHistory[0];
+function buildStartMsg() {
+  const s1 = ts(1), s2 = ts(2);
+  const avg1 = overallAvg(1), avg5 = overallAvg(2);
   return [
     `📊 <b>Scratch Card Tracker</b> ${VERSION}`,
     '',
-    `Son: <code>$${last.usd.toFixed(2)}</code>`,
-    `📍 Döngü: ${posInCycle}/${CYCLE_SIZE} — Avg: $${cycleAvg.toFixed(2)}`,
-    `${sEmoji} Streak: ${streak}`,
+    `💎 1 dolarlık paketlerden kaçı açıldı?`,
+    `→ ${s1.count}/${SC1_TARGET}${avg1 !== null ? `  (Ort: $${avg1.toFixed(2)})` : ''}`,
     '',
-    avgLines,
-    '',
-    `🔢 Toplam claim: ${claimCount}`,
-    `📦 <code>${CONTRACT}</code>`,
+    `🎱 5 dolarlık paketlerden kaçı açıldı?`,
+    `→ ${s2.count}/${SC5_TARGET}${avg5 !== null ? `  (Ort: $${avg5.toFixed(2)})` : ''}`,
   ].join('\n');
 }
 
-// ─── Main ─────────────────────────────────────────────────────────────────────
+function buildTierMsg(tierNum) {
+  const state    = ts(tierNum);
+  const tierInfo = getTierInfo(tierNum);
+  const target   = tierNum === 1 ? SC1_TARGET : SC5_TARGET;
+
+  if (!state.count)
+    return `${tierInfo.emoji} Henüz ${tierInfo.name} kaydı yok.`;
+
+  const posInCycle = ((state.count - 1) % CYCLE_SIZE) + 1;
+  const cycleAvg   = state.history.slice(0, posInCycle).reduce((s, c) => s + c.usd, 0) / posInCycle;
+  const sEmoji     = state.streakDir === 'down' ? '🔴' : '🟢';
+
+  const avgLines = [5, 10, 15, 20, 50, 100]
+    .map(n => { const v = calcAvg(state.history, n); return v !== null ? `Avg${n}: $${v.toFixed(2)}` : null; })
+    .filter(Boolean).join('\n');
+
+  return [
+    `${tierInfo.emoji} <b>${tierInfo.name.toUpperCase()} İstatistikleri</b> ${VERSION}`,
+    '',
+    `Toplam: ${state.count}/${target}`,
+    `📍 Döngü: ${posInCycle}/${CYCLE_SIZE} — Avg: $${cycleAvg.toFixed(2)}`,
+    `${sEmoji} Streak: ${state.streak}`,
+    '',
+    avgLines || 'Yetersiz veri',
+  ].join('\n');
+}
+
+// ─ Main ───────────────────────────────────────────────────────────────────────────
 async function main() {
   provider = await getProvider();
-
   bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
-  bot.onText(/\/start|\/durum/, (msg) => {
-    bot.sendMessage(msg.chat.id, buildStatusMsg(), { parse_mode: 'HTML' })
+  bot.onText(/\/start/, (msg) => {
+    bot.sendMessage(msg.chat.id, buildStartMsg(), { parse_mode: 'HTML' })
+      .catch(e => bot.sendMessage(msg.chat.id, `Hata: ${e.message}`));
+  });
+
+  bot.onText(/\/sc1/, (msg) => {
+    bot.sendMessage(msg.chat.id, buildTierMsg(1), { parse_mode: 'HTML' })
+      .catch(e => bot.sendMessage(msg.chat.id, `Hata: ${e.message}`));
+  });
+
+  bot.onText(/\/sc5/, (msg) => {
+    bot.sendMessage(msg.chat.id, buildTierMsg(2), { parse_mode: 'HTML' })
       .catch(e => bot.sendMessage(msg.chat.id, `Hata: ${e.message}`));
   });
 
@@ -465,11 +457,8 @@ async function main() {
     if (e.message?.includes('409')) {
       pollingErrCount++;
       if (pollingErrCount === 1)
-        console.error('[TG] 409 Conflict — başka bir bot instance aktif! Eski versiyonu durdur.');
-      if (pollingErrCount > 80) {
-        console.error('[TG] 80+ ardalan 409 — process restart için çıkılıyor');
-        process.exit(1);
-      }
+        console.error('[TG] 409 Conflict — başka bir bot instance aktif! Eski Railway/Northflank instance\'ını durdur.');
+      if (pollingErrCount > 80) { console.error('[TG] 80+ ardalan 409, yeniden başlatılıyor'); process.exit(1); }
     } else {
       pollingErrCount = 0;
       console.error('[TG polling]', e.message);
@@ -477,10 +466,8 @@ async function main() {
   });
 
   console.log(`[${VERSION}] Contract: ${CONTRACT}`);
-
-  await loadHistoryViaBlockscout(200);
-  console.log(`[HISTORY] ${claimHistory.length} claim hazır`);
-
+  await loadHistory();
+  console.log(`[HISTORY] opal=${ts(1).count}  jade=${ts(2).count}`);
   lastPollBlock = 0;
   await pollLoop();
 }
