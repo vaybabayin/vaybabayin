@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v9.1';
+const VERSION = 'v9.2';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -25,7 +25,6 @@ const RPCS = [
   'https://base.blockscout.com/api/eth-rpc',
 ].filter(Boolean);
 
-// Tier config — $1 (opal) ve $5 (jade) tam bildirim; diğer tierlar kısa spam
 const TIER_INFO = {
   1: { name: 'opal', emoji: '💎', nominalUsd: 1, target: SC1_TARGET },
   2: { name: 'jade', emoji: '🎱', nominalUsd: 5, target: SC5_TARGET },
@@ -40,8 +39,6 @@ const CLAIM_SELECTORS = new Set([
   '0xdb006a75', '0x96c55175', '0xae169a50',
 ]);
 
-// claim(uint64 batchId, uint8 tier, uint256 seed, uint256 nonce, uint256 deadline)
-// 0x(2)+selector(8)+batchId(64)+tier(64)+seed(64)+nonce(64)+deadline(64) = 330 chars
 function isClaimInput(data) {
   if (!data || data.length < 10) return false;
   if (CLAIM_SELECTORS.has(data.slice(0, 10).toLowerCase())) return true;
@@ -51,7 +48,7 @@ function isClaimInput(data) {
 
 function decodeTier(data) {
   if (!data || data.length !== 330) return null;
-  const t = parseInt(data.slice(74, 138), 16); // offset: 10(sel)+64(batchId)
+  const t = parseInt(data.slice(74, 138), 16);
   return (t >= 1 && t <= 20) ? t : null;
 }
 
@@ -211,15 +208,35 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
   if (!receipt || receipt.status === 0) return;
 
   const claimer = from.toLowerCase();
+
+  // Only accept ERC20 transfers where:
+  //   (a) the token contract IS our scratch card contract, OR
+  //   (b) the transfer is FROM our scratch card contract
+  // This filters out WETH swaps, DEX router transfers, etc. in the same TX.
   const received = {};
   for (const log of receipt.logs) {
     if (log.topics[0]?.toLowerCase() !== TRANSFER_TOPIC) continue;
     if (log.topics.length < 3) continue;
-    const to = ('0x' + log.topics[2].slice(26)).toLowerCase();
-    if (to !== claimer) continue;
+    const to       = ('0x' + log.topics[2].slice(26)).toLowerCase();
+    const fromLog  = ('0x' + log.topics[1].slice(26)).toLowerCase();
     const tokenAddr = log.address.toLowerCase();
+    if (to !== claimer) continue;
+    if (tokenAddr !== CONTRACT_LOWER && fromLog !== CONTRACT_LOWER) continue; // skip unrelated
     const amount = BigInt(log.data);
     received[tokenAddr] = (received[tokenAddr] ?? 0n) + amount;
+  }
+
+  if (!Object.keys(received).length) {
+    // Fallback: accept any transfer TO claimer (older behaviour) only if no contract-filtered result
+    for (const log of receipt.logs) {
+      if (log.topics[0]?.toLowerCase() !== TRANSFER_TOPIC) continue;
+      if (log.topics.length < 3) continue;
+      const to = ('0x' + log.topics[2].slice(26)).toLowerCase();
+      if (to !== claimer) continue;
+      const tokenAddr = log.address.toLowerCase();
+      const amount = BigInt(log.data);
+      received[tokenAddr] = (received[tokenAddr] ?? 0n) + amount;
+    }
   }
 
   if (!Object.keys(received).length) return;
@@ -230,8 +247,9 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
       const info  = await getTokenInfo(addr);
       const human = Number(ethers.formatUnits(rawAmt, info.decimals));
       const price = await getTokenPriceUsd(addr);
-      if (!price) continue;
+      if (!price) { console.log(`[NO PRICE] ${info.symbol || addr.slice(0,10)}`); continue; }
       const usd = human * price;
+      console.log(`[TOKEN] ${info.symbol} amt=${human.toFixed(4)} price=$${price.toExponential(3)} => $${usd.toFixed(4)}`);
       if (usd > bestUsd) { bestUsd = usd; bestToken = { addr, ...info, price }; }
     } catch (_) {}
   }
@@ -255,11 +273,10 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
   state.history.unshift({ usd: bestUsd, ts: blockTs * 1000, hash: txHash, claimer: from });
   if (state.history.length > 200) state.history.pop();
 
-  const date   = new Date(blockTs * 1000).toISOString().replace('T', ' ').slice(0, 19) + 'Z';
-  const txUrl  = `https://basescan.org/tx/${txHash}`;
+  const date  = new Date(blockTs * 1000).toISOString().replace('T', ' ').slice(0, 19) + 'Z';
+  const txUrl = `https://basescan.org/tx/${txHash}`;
 
   if (TIER_INFO[tier]) {
-    // ── Tam bildirim: opal ($1) ve jade ($5) ──────────────────────────────────
     const posInCycle = ((state.count - 1) % CYCLE_SIZE) + 1;
     const remaining  = CYCLE_SIZE - posInCycle;
     const cycleAvg   = state.history.slice(0, posInCycle).reduce((s, c) => s + c.usd, 0) / posInCycle;
@@ -267,7 +284,6 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
       .map(n => { const v = calcAvg(state.history, n); return v !== null ? `Avg${n} $${v.toFixed(2)}` : null; })
       .filter(Boolean).join(' | ');
     const sEmoji = state.streakDir === 'down' ? '🔴' : '🟢';
-
     const msg = [
       `${tierInfo.emoji} Total Value: $${bestUsd.toFixed(2)} [${tierInfo.name}]`,
       `📍 Döngü: ${posInCycle}/${CYCLE_SIZE} (~${remaining} kaldı) — Döngü Avg: $${cycleAvg.toFixed(2)}`,
@@ -276,11 +292,9 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
       `👤 ${from}`,
       `🕐 ${date} | <a href="${txUrl}">TX</a>`,
     ].filter(Boolean).join('\n');
-
-    console.log(`[✓] ${tierInfo.name} $${bestUsd.toFixed(2)} cycle=${((state.count-1)%CYCLE_SIZE)+1}/${CYCLE_SIZE} streak=${state.streak} | ${txHash.slice(0,10)}`);
+    console.log(`[✓] ${tierInfo.name} $${bestUsd.toFixed(2)} cycle=${posInCycle}/${CYCLE_SIZE} streak=${state.streak} | ${txHash.slice(0,10)}`);
     await sendNotification(msg);
   } else {
-    // ── Kısa spam bildirimi: diğer tüm tierlar ─────────────────────────────────────
     const msg = `${tierInfo.emoji} $${bestUsd.toFixed(2)} [${tierInfo.name}] 👤 ${from} 🕐 ${date} | <a href="${txUrl}">TX</a>`;
     console.log(`[spam] tier${tier} $${bestUsd.toFixed(2)} | ${txHash.slice(0,10)}`);
     await sendNotification(msg);
@@ -436,9 +450,25 @@ async function handleConversationReply(chatId, text) {
   }
 }
 
+async function validateChannel() {
+  if (!CHANNEL_ID) return;
+  try {
+    const me = await bot.getMe();
+    const meId = String(me.id);
+    const chanStr = String(CHANNEL_ID);
+    if (chanStr === meId || chanStr === '@' + me.username) {
+      console.error(`[HATA] TELEGRAM_CHANNEL_ID bota ait ID! Bir kanal veya grup ID'si girin (orn: -1001234567890)`);
+      process.exit(1);
+    }
+    console.log(`[CHANNEL] ${CHANNEL_ID} kullanılıyor`);
+  } catch (e) { console.warn('[CHANNEL validate]', e.message); }
+}
+
 async function main() {
   provider = await getProvider();
   bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+
+  await validateChannel();
 
   bot.onText(/\/start/, (msg) => startConversation(msg.chat.id).catch(console.error));
   bot.onText(/\/sc1/,   (msg) => bot.sendMessage(msg.chat.id, buildTierMsg(1), { parse_mode: 'HTML' }).catch(console.error));
@@ -455,8 +485,8 @@ async function main() {
     if (e.message?.includes('409')) {
       pollingErrCount++;
       if (pollingErrCount === 1)
-        console.error('[TG] 409 Conflict — başka bir instance aktif! Eski Railway/Northflank instance\'ını durdur.');
-      if (pollingErrCount > 80) { console.error('[TG] 80+ 409, çıkılıyor'); process.exit(1); }
+        console.error('[TG] 409 Conflict — başka bir instance aktif!');
+      if (pollingErrCount > 80) { process.exit(1); }
     } else {
       pollingErrCount = 0;
       console.error('[TG polling]', e.message);
