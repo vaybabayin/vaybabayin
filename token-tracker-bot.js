@@ -3,312 +3,468 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v6';
+const VERSION = 'v7';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID;
+const CONTRACT = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
+
 if (!TELEGRAM_TOKEN) { console.error('TELEGRAM_BOT_TOKEN eksik!'); process.exit(1); }
+if (!CHANNEL_ID) console.warn('[WARN] TELEGRAM_CHANNEL_ID ayarlı değil — otomatik bildirim kapalı');
 
-const CONTRACT = (process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296').toLowerCase();
+const CONTRACT_LOWER = CONTRACT.toLowerCase();
 
-// Standart RPC'ler önce, blockscout sona — bazı RPC'lerde eth_call gerçek hatayı göstermez
 const RPCS = [
   'https://mainnet.base.org',
   'https://base-rpc.publicnode.com',
   process.env.RPC_URL_1,
   process.env.RPC_URL_2,
   'https://base.gateway.tenderly.co',
+  'https://1rpc.io/base',
   'https://base.blockscout.com/api/eth-rpc',
 ].filter(Boolean);
 
-// Base sabitleri
-const WETH             = '0x4200000000000000000000000000000000000006';
-const USDC             = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
-const UNI_V3_FACTORY   = '0x33128a8fC17869897dcE68Ed026d694621f6FDfD';
-const AERO_V3_FACTORY  = '0x5e7BB104d84c7CB9B682AaC2F3d509f5F406809A'; // Aerodrome Slipstream
+// Known claim() function selectors
+// claim()           0x4e71d92d
+// claim(uint256)    0x379607f5
+// claim(address)    0x1e83409a
+// claimTokens()     0x48c54b9d
+// redeem(uint256)   0x2e7ba6ef
+// scratch()         0xbd66528a
+const CLAIM_SELECTORS = new Set([
+  '0x4e71d92d', '0x379607f5', '0x1e83409a',
+  '0x48c54b9d', '0x2e7ba6ef', '0xbd66528a',
+  '0xdb006a75', '0x96c55175', '0x7d49ec34',
+]);
+
+const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 const CHAINLINK_ETHUSD = '0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70';
+const WETH  = '0x4200000000000000000000000000000000000006';
+const USDC  = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
+const UNI_FACTORY  = '0x33128a8fC17869897dcE68Ed026d694621f6FDfD';
+const AERO_FACTORY = '0x420DD381b31aEf6683db6B902084cB0FFECe40Da';
 
-const FACTORY_ABI   = ['function getPool(address,address,uint24) view returns (address)'];
-const POOL_ABI      = [
-  'event Swap(address indexed sender,address indexed recipient,int256 amount0,int256 amount1,uint160 sqrtPriceX96,uint128 liquidity,int24 tick)',
-  'function token0() view returns (address)',
-  'function token1() view returns (address)',
-  'function slot0() view returns (uint160 sqrtPriceX96,int24 tick,uint16,uint16,uint16,uint8,bool)',
-];
-const ERC20_ABI     = ['function decimals() view returns (uint8)','function symbol() view returns (string)','function name() view returns (string)'];
-const CHAINLINK_ABI = ['function latestAnswer() view returns (int256)'];
+// ─── State ───────────────────────────────────────────────────────────────────
+let claimHistory = [];   // most-recent first, max 200
+const CYCLE_SIZE = 50;
+let claimCount = 0;      // total claims ever processed
+let streak = 0;
+let streakDir = null;    // 'up' | 'down'
+let processedTxs = new Set();
 
-const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+let provider, bot;
+let tokenInfoCache = {};
+let priceCache = {};     // tokenAddr -> { price, at }
+let ethPrice = 0, ethPriceAt = 0;
+let lastPollBlock = 0;
 
-let provider, poolContract, poolAddress, dexName='Uniswap V3';
-let token0, token1, tokenIsToken0;
-let tokenDecimals = 18, tokenSymbol = 'TOKEN', tokenName = '';
-let quoteToken;
-let recentSwaps = [];
-let isReady = false, initErr = null;
-let ethPriceCache = 0, ethPriceCacheAt = 0;
-let workingRpc = null;
-
-// ─── RPC ──────────────────────────────────────────────────────────────────
+// ─── Provider ────────────────────────────────────────────────────────────────
 async function getProvider() {
   for (const rpc of RPCS) {
     try {
       const p = new ethers.JsonRpcProvider(rpc);
-      await Promise.race([p.getBlockNumber(), new Promise((_,r)=>setTimeout(()=>r(new Error('timeout')),5000))]);
-      console.log(`[RPC] ✓ ${rpc}`);
-      workingRpc = rpc;
+      await Promise.race([
+        p.getBlockNumber(),
+        new Promise((_, r) => setTimeout(() => r(new Error('timeout')), 5000)),
+      ]);
+      console.log(`[RPC ✓] ${rpc}`);
       return p;
-    } catch(e) { console.log(`[RPC] ✗ ${rpc}: ${e.message}`); }
+    } catch (e) {
+      console.log(`[RPC ✗] ${e.message.slice(0, 80)}`);
+    }
   }
   throw new Error('Hiçbir RPC bağlanamadı');
 }
 
-// ─── Contract var mı kontrolü ───────────────────────────────────────────────────
-async function checkContract() {
-  const code = await provider.getCode(CONTRACT);
-  if (!code || code === '0x') throw new Error(`Contract ${CONTRACT.slice(0,10)}... Base'de bulunamadı (no bytecode)`);
-  console.log(`[CODE] ${code.length} bytes`);
-  return true;
+// ─── ETH/USD ─────────────────────────────────────────────────────────────────
+async function getEthUsd() {
+  if (Date.now() - ethPriceAt < 60_000 && ethPrice > 0) return ethPrice;
+  try {
+    const cl = new ethers.Contract(
+      CHAINLINK_ETHUSD,
+      ['function latestAnswer() view returns (int256)'],
+      provider
+    );
+    ethPrice = Number(await cl.latestAnswer()) / 1e8;
+    ethPriceAt = Date.now();
+  } catch (_) { if (!ethPrice) ethPrice = 3000; }
+  return ethPrice;
 }
 
-// ─── Token bilgileri — Blockscout API + RPC fallback ────────────────────────────────
-async function fetchTokenInfo() {
-  // 1) Blockscout REST API
+// ─── Token info ───────────────────────────────────────────────────────────────
+async function getTokenInfo(address) {
+  const k = address.toLowerCase();
+  if (tokenInfoCache[k]) return tokenInfoCache[k];
+  let symbol = '???', decimals = 18;
   try {
-    const r = await axios.get(`https://base.blockscout.com/api/v2/tokens/${CONTRACT}`, { timeout: 8000 });
-    const d = r.data;
-    if (d?.symbol) {
-      tokenSymbol   = d.symbol;
-      tokenName     = d.name || d.symbol;
-      tokenDecimals = parseInt(d.decimals || 18);
-      console.log(`[BS-API] ${tokenName} (${tokenSymbol}) decimals=${tokenDecimals}`);
-      return;
+    const r = await axios.get(
+      `https://base.blockscout.com/api/v2/tokens/${address}`,
+      { timeout: 6000 }
+    );
+    if (r.data?.symbol) {
+      symbol   = r.data.symbol;
+      decimals = parseInt(r.data.decimals ?? 18);
+      tokenInfoCache[k] = { symbol, decimals };
+      return tokenInfoCache[k];
     }
-  } catch(e) { console.log('[BS-API] hata:', e.message); }
-
-  // 2) RPC üzerinden ERC20 çağrıları (catch ile)
-  const erc20 = new ethers.Contract(CONTRACT, ERC20_ABI, provider);
-  try { tokenSymbol   = await erc20.symbol();   console.log(`[ERC20] symbol=${tokenSymbol}`); } catch(_) {}
-  try { tokenName     = await erc20.name();     console.log(`[ERC20] name=${tokenName}`);   } catch(_) {}
-  try { tokenDecimals = Number(await erc20.decimals()); console.log(`[ERC20] decimals=${tokenDecimals}`); } catch(_) {}
+  } catch (_) {}
+  const c = new ethers.Contract(
+    address,
+    ['function symbol() view returns (string)', 'function decimals() view returns (uint8)'],
+    provider
+  );
+  try { symbol   = await c.symbol();             } catch (_) {}
+  try { decimals = Number(await c.decimals());   } catch (_) {}
+  tokenInfoCache[k] = { symbol, decimals };
+  return tokenInfoCache[k];
 }
 
-// ─── ETH/USD ───────────────────────────────────────────────────────────────
-async function getEthPrice() {
-  if (Date.now() - ethPriceCacheAt < 60_000 && ethPriceCache > 0) return ethPriceCache;
-  try {
-    const cl = new ethers.Contract(CHAINLINK_ETHUSD, CHAINLINK_ABI, provider);
-    ethPriceCache = Number(await cl.latestAnswer()) / 1e8;
-    ethPriceCacheAt = Date.now();
-    return ethPriceCache;
-  } catch(e) { return ethPriceCache || 3000; }
-}
+// ─── Token USD price ─────────────────────────────────────────────────────────
+async function getTokenPriceUsd(address) {
+  const k = address.toLowerCase();
+  const cached = priceCache[k];
+  if (cached && Date.now() - cached.at < 60_000) return cached.price;
 
-// ─── Pool bul — Blockscout token-pools API önce ──────────────────────────────────
-async function findPoolViaApi() {
-  try {
-    // Blockscout: token holders olarak DEX pool'ları listelenir
-    const r = await axios.get(`https://base.blockscout.com/api/v2/tokens/${CONTRACT}/holders?limit=20`, { timeout: 10000 });
-    const items = r.data?.items || [];
-    for (const it of items) {
-      const addr = it.address?.hash;
-      if (!addr) continue;
-      // Test: bu adres bir Uniswap V3 pool mu?
-      try {
-        const c = new ethers.Contract(addr, POOL_ABI, provider);
-        const t0 = await c.token0();
-        const t1 = await c.token1();
-        const otherToken = t0.toLowerCase() === CONTRACT ? t1.toLowerCase() : t0.toLowerCase();
-        if ([WETH.toLowerCase(), USDC.toLowerCase()].includes(otherToken)) {
-          const name = otherToken === WETH.toLowerCase() ? 'WETH' : 'USDC';
-          const decs = otherToken === WETH.toLowerCase() ? 18 : 6;
-          console.log(`[POOL-API] ${addr} (${name})`);
-          return { address: addr, quoteToken: { address: otherToken === WETH.toLowerCase()?WETH:USDC, name, decimals: decs } };
-        }
-      } catch(_) {}
-    }
-  } catch(e) { console.log('[POOL-API] hata:', e.message); }
-  return null;
-}
+  const { decimals } = await getTokenInfo(address);
 
-async function findPoolViaFactory() {
-  const factory = new ethers.Contract(UNI_V3_FACTORY, FACTORY_ABI, provider);
-  const quotes = [
-    { address: WETH, name: 'WETH', decimals: 18 },
-    { address: USDC, name: 'USDC', decimals: 6 },
-  ];
-  for (const qt of quotes) {
+  // Uniswap V3
+  const uniFactory = new ethers.Contract(
+    UNI_FACTORY,
+    ['function getPool(address,address,uint24) view returns (address)'],
+    provider
+  );
+  for (const [quote, qDec, isEth] of [[WETH, 18, true], [USDC, 6, false]]) {
     for (const fee of [100, 500, 3000, 10000]) {
       try {
-        const addr = await factory.getPool(CONTRACT, qt.address, fee);
-        if (addr && addr !== ethers.ZeroAddress) {
-          console.log(`[POOL-FACTORY] ${addr} (${qt.name} fee=${fee})`);
-          return { address: addr, quoteToken: qt };
+        const poolAddr = await uniFactory.getPool(address, quote, fee);
+        if (!poolAddr || poolAddr === ethers.ZeroAddress) continue;
+        const pool = new ethers.Contract(poolAddr, [
+          'function slot0() view returns (uint160,int24,uint16,uint16,uint16,uint8,bool)',
+          'function token0() view returns (address)',
+        ], provider);
+        const [s, t0] = await Promise.all([pool.slot0(), pool.token0()]);
+        const isT0 = t0.toLowerCase() === k;
+        const sq = Number(s[0]) / 2 ** 96;
+        const pr = sq * sq;
+        const priceInQuote = isT0
+          ? pr * (10 ** qDec) / (10 ** decimals)
+          : (1 / pr) * (10 ** decimals) / (10 ** qDec);
+        const priceUsd = isEth ? priceInQuote * await getEthUsd() : priceInQuote;
+        if (priceUsd > 0 && priceUsd < 1e12) {
+          priceCache[k] = { price: priceUsd, at: Date.now() };
+          console.log(`[PRICE] UniV3 $${priceUsd.toExponential(4)}`);
+          return priceUsd;
         }
-      } catch(_) {}
+      } catch (_) {}
     }
   }
+
+  // Aerodrome V2
+  const aeroFactory = new ethers.Contract(
+    AERO_FACTORY,
+    ['function getPair(address,address,bool) view returns (address)'],
+    provider
+  );
+  for (const [quote, qDec, isEth] of [[WETH, 18, true], [USDC, 6, false]]) {
+    for (const stable of [false, true]) {
+      try {
+        const pairAddr = await aeroFactory.getPair(address, quote, stable);
+        if (!pairAddr || pairAddr === ethers.ZeroAddress) continue;
+        const pair = new ethers.Contract(pairAddr, [
+          'function getReserves() view returns (uint112,uint112,uint32)',
+          'function token0() view returns (address)',
+        ], provider);
+        const [res, t0] = await Promise.all([pair.getReserves(), pair.token0()]);
+        const isT0 = t0.toLowerCase() === k;
+        const tokR = Number(ethers.formatUnits(isT0 ? res[0] : res[1], decimals));
+        const quoR = Number(ethers.formatUnits(isT0 ? res[1] : res[0], qDec));
+        if (tokR <= 0 || quoR <= 0) continue;
+        const priceUsd = isEth
+          ? (quoR / tokR) * await getEthUsd()
+          : quoR / tokR;
+        if (priceUsd > 0 && priceUsd < 1e12) {
+          priceCache[k] = { price: priceUsd, at: Date.now() };
+          console.log(`[PRICE] Aerodrome $${priceUsd.toExponential(4)}`);
+          return priceUsd;
+        }
+      } catch (_) {}
+    }
+  }
+
+  // DexScreener fallback
+  try {
+    const r = await axios.get(
+      `https://api.dexscreener.com/latest/dex/tokens/${address}`,
+      { timeout: 8000 }
+    );
+    const pairs = (r.data?.pairs || []).filter(p => p.chainId === 'base');
+    if (pairs.length) {
+      const price = parseFloat(pairs[0].priceUsd);
+      if (price > 0) {
+        priceCache[k] = { price, at: Date.now() };
+        console.log(`[PRICE] DexScreener $${price.toExponential(4)}`);
+        return price;
+      }
+    }
+  } catch (_) {}
+
+  console.warn(`[PRICE] ${address.slice(0, 10)}... için fiyat bulunamadı`);
   return null;
 }
 
-async function findPool() {
-  // Önce API ile, sonra factory ile
-  let found = await findPoolViaApi();
-  if (!found) found = await findPoolViaFactory();
-  return found;
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+function calcAvg(arr, n) {
+  if (arr.length < n) return null;
+  return arr.slice(0, n).reduce((s, v) => s + v.usd, 0) / n;
 }
 
-async function swapToRate(amount0, amount1) {
-  const tokenAmt = Math.abs(Number(ethers.formatUnits(tokenIsToken0 ? amount0 : amount1, tokenDecimals)));
-  const quoteAmt = Math.abs(Number(ethers.formatUnits(tokenIsToken0 ? amount1 : amount0, quoteToken.decimals)));
-  if (quoteAmt === 0) return null;
-  const usd = quoteToken.address.toLowerCase() === WETH.toLowerCase()
-    ? quoteAmt * (await getEthPrice())
-    : quoteAmt;
-  if (usd === 0) return null;
-  return tokenAmt / usd;
+function isClaimInput(data) {
+  if (!data || data.length < 10) return false;
+  return CLAIM_SELECTORS.has(data.slice(0, 10).toLowerCase());
 }
 
-async function getSpotPriceUsd() {
-  const s = await poolContract.slot0();
-  const p = (Number(s.sqrtPriceX96) / 2**96) ** 2;
-  let tip;
-  if (tokenIsToken0) tip = p * (10**quoteToken.decimals) / (10**tokenDecimals);
-  else               tip = (1/p) * (10**tokenDecimals) / (10**quoteToken.decimals);
-  return quoteToken.address.toLowerCase() === WETH.toLowerCase()
-    ? tip * (await getEthPrice())
-    : tip;
-}
+// ─── Core: process one claim TX ───────────────────────────────────────────────
+async function processClaimTx(txHash, from, data, blockNum, blockTs) {
+  if (processedTxs.has(txHash)) return;
+  processedTxs.add(txHash);
+  if (processedTxs.size > 20000) {
+    const arr = [...processedTxs];
+    processedTxs = new Set(arr.slice(-10000));
+  }
 
-async function fetchHistory() {
+  let receipt;
   try {
-    const cur = await provider.getBlockNumber();
-    const evts = await poolContract.queryFilter(poolContract.filters.Swap(), cur - 2000, cur);
-    console.log(`[HISTORY] ${evts.length} event`);
-    const swaps = [];
-    for (const e of evts.reverse()) {
-      const { amount0, amount1 } = e.args;
-      const isBuy = tokenIsToken0 ? amount0 < 0n : amount1 < 0n;
-      if (!isBuy) continue;
-      const rate = await swapToRate(amount0, amount1);
-      if (rate && rate > 0) swaps.push({ tokensPerDollar: rate, ts: Date.now(), hash: e.transactionHash });
-    }
-    recentSwaps = [...swaps, ...recentSwaps]
-      .filter((v,i,a) => a.findIndex(x => x.hash === v.hash) === i)
-      .slice(0, 100);
-    console.log(`[HISTORY] ${recentSwaps.length} buy kayıtlı`);
-  } catch(e) { console.error('[HISTORY]', e.message); }
-}
+    receipt = await provider.getTransactionReceipt(txHash);
+  } catch (_) { return; }
+  if (!receipt || receipt.status === 0) return;
 
-function startListener() {
-  poolContract.on('Swap', async (sender, recipient, amount0, amount1) => {
+  const claimer = from.toLowerCase();
+
+  // Collect ERC20 transfers TO the claimer
+  const received = {};
+  for (const log of receipt.logs) {
+    if (log.topics[0]?.toLowerCase() !== TRANSFER_TOPIC) continue;
+    if (log.topics.length < 3) continue;
+    const to = ('0x' + log.topics[2].slice(26)).toLowerCase();
+    if (to !== claimer) continue;
+    const tokenAddr = log.address.toLowerCase();
+    const amount = BigInt(log.data);
+    received[tokenAddr] = (received[tokenAddr] ?? 0n) + amount;
+  }
+
+  if (!Object.keys(received).length) {
+    console.log(`[SKIP] ${txHash.slice(0, 10)} — transfer bulunamadı`);
+    return;
+  }
+
+  // Find token with highest USD value
+  let bestUsd = 0, bestToken = null, bestHuman = 0;
+  for (const [addr, rawAmt] of Object.entries(received)) {
     try {
-      const isBuy = tokenIsToken0 ? amount0 < 0n : amount1 < 0n;
-      if (!isBuy) return;
-      const rate = await swapToRate(amount0, amount1);
-      if (!rate || rate <= 0) return;
-      recentSwaps.unshift({ tokensPerDollar: rate, ts: Date.now(), hash: null });
-      if (recentSwaps.length > 100) recentSwaps.pop();
-      console.log(`[SWAP] ${rate.toFixed(0)} token/$1`);
-    } catch(e) { console.error('[SWAP]', e.message); }
+      const info  = await getTokenInfo(addr);
+      const human = Number(ethers.formatUnits(rawAmt, info.decimals));
+      const price = await getTokenPriceUsd(addr);
+      if (!price) continue;
+      const usd = human * price;
+      if (usd > bestUsd) { bestUsd = usd; bestHuman = human; bestToken = { addr, ...info, price }; }
+    } catch (_) {}
+  }
+
+  if (!bestToken || bestUsd <= 0) {
+    console.log(`[SKIP] ${txHash.slice(0, 10)} — fiyat bulunamadı`);
+    return;
+  }
+
+  // Packet type heuristic ($1 vs $5)
+  const packetType = bestUsd >= 2.5 ? '$5' : '$1';
+
+  // Update streak
+  if (claimHistory.length > 0) {
+    const dir = bestUsd >= claimHistory[0].usd ? 'up' : 'down';
+    streak    = dir === streakDir ? streak + 1 : 1;
+    streakDir = dir;
+  } else {
+    streak = 1; streakDir = null;
+  }
+
+  // Record
+  claimCount++;
+  claimHistory.unshift({ usd: bestUsd, ts: blockTs * 1000, hash: txHash, claimer: from });
+  if (claimHistory.length > 200) claimHistory.pop();
+
+  // Cycle
+  const posInCycle = ((claimCount - 1) % CYCLE_SIZE) + 1;
+  const remaining  = CYCLE_SIZE - posInCycle;
+  const cycleAvg   = claimHistory.slice(0, posInCycle).reduce((s, c) => s + c.usd, 0) / posInCycle;
+
+  // Moving averages
+  const avgLine = [5, 10, 15, 20, 50, 100]
+    .map(n => { const v = calcAvg(claimHistory, n); return v !== null ? `Avg${n} $${v.toFixed(2)}` : null; })
+    .filter(Boolean)
+    .join(' | ');
+
+  const sEmoji = streakDir === 'up' ? '🔺' : '🔻';
+  const date   = new Date(blockTs * 1000).toISOString().replace('T', ' ').slice(0, 19) + 'Z';
+  const txUrl  = `https://basescan.org/tx/${txHash}`;
+
+  const msg = [
+    `Total Value: $${bestUsd.toFixed(2)} [${packetType}]`,
+    `📍 Döngü: ${posInCycle}/${CYCLE_SIZE} (~${remaining} kaldı) — Döngü Avg: $${cycleAvg.toFixed(2)}`,
+    `${sEmoji} Streak: ${streak}`,
+    avgLine ? `📊 ${avgLine}` : null,
+    `👤 ${from}`,
+    `🕐 ${date} | <a href="${txUrl}">TX</a>`,
+  ].filter(Boolean).join('\n');
+
+  console.log(`[✓] $${bestUsd.toFixed(2)} [${packetType}] cycle=${posInCycle}/${CYCLE_SIZE} streak=${streak} | ${txHash.slice(0, 10)}`);
+
+  if (CHANNEL_ID) {
+    try {
+      await bot.sendMessage(CHANNEL_ID, msg, {
+        parse_mode: 'HTML',
+        disable_web_page_preview: true,
+      });
+    } catch (e) { console.error('[TG]', e.message); }
+  }
+}
+
+// ─── getLogs helper (two strategies) ─────────────────────────────────────────
+async function getClaimLogs(fromBlock, toBlock) {
+  // Strategy A: Transfer events FROM the contract (contract holds a separate token)
+  const logsA = await provider.getLogs({
+    fromBlock,
+    toBlock,
+    topics: [TRANSFER_TOPIC, ethers.zeroPadValue(CONTRACT, 32)],
+  }).catch(() => []);
+
+  // Strategy B: Transfer events ON the contract (contract is the token)
+  const logsB = await provider.getLogs({
+    fromBlock,
+    toBlock,
+    address: CONTRACT,
+    topics: [TRANSFER_TOPIC],
+  }).catch(() => []);
+
+  // Deduplicate by txHash
+  const txMap = new Map();
+  for (const log of [...logsA, ...logsB]) {
+    if (!txMap.has(log.transactionHash))
+      txMap.set(log.transactionHash, log.blockNumber);
+  }
+  return txMap;
+}
+
+// ─── Initial history load ─────────────────────────────────────────────────────
+async function loadHistory(numBlocks = 500) {
+  console.log(`[HISTORY] Son ${numBlocks} blok taranıyor...`);
+  const cur  = await provider.getBlockNumber();
+  const from = Math.max(0, cur - numBlocks);
+
+  const txMap = await getClaimLogs(from, cur);
+  const sorted = [...txMap.entries()].sort((a, b) => a[1] - b[1]); // oldest first
+  console.log(`[HISTORY] ${sorted.length} potansiyel TX`);
+
+  for (const [txHash, blockNum] of sorted) {
+    try {
+      const tx = await provider.getTransaction(txHash);
+      if (!tx || tx.to?.toLowerCase() !== CONTRACT_LOWER) continue;
+      if (!isClaimInput(tx.data || '')) continue;
+      const block = await provider.getBlock(blockNum);
+      await processClaimTx(txHash, tx.from, tx.data, blockNum, block.timestamp);
+    } catch (_) {}
+  }
+
+  console.log(`[HISTORY] ${claimHistory.length} claim yüklendi`);
+}
+
+// ─── Live poll loop ───────────────────────────────────────────────────────────
+async function pollLoop() {
+  let fails = 0;
+  console.log('[POLL] Canlı izleme başlıyor...');
+
+  while (true) {
+    try {
+      const cur = await provider.getBlockNumber();
+      if (lastPollBlock === 0) lastPollBlock = cur - 1;
+
+      if (cur > lastPollBlock) {
+        const fromB = lastPollBlock + 1;
+        const toB   = Math.min(cur, lastPollBlock + 30);
+
+        const txMap = await getClaimLogs(fromB, toB);
+
+        for (const [txHash, blockNum] of txMap) {
+          if (processedTxs.has(txHash)) continue;
+          try {
+            const tx = await provider.getTransaction(txHash);
+            if (!tx || tx.to?.toLowerCase() !== CONTRACT_LOWER) continue;
+            if (!isClaimInput(tx.data || '')) continue;
+            const block = await provider.getBlock(blockNum);
+            await processClaimTx(txHash, tx.from, tx.data, blockNum, block.timestamp);
+          } catch (e) { console.error(`[TX ${txHash.slice(0, 10)}]`, e.message.slice(0, 80)); }
+        }
+
+        lastPollBlock = toB;
+      }
+
+      fails = 0;
+      await new Promise(r => setTimeout(r, 2000));
+    } catch (e) {
+      fails++;
+      console.error('[POLL]', e.message.slice(0, 80));
+      if (fails >= 5) {
+        try { provider = await getProvider(); fails = 0; } catch (_) {}
+      }
+      await new Promise(r => setTimeout(r, Math.min(fails * 3000, 30000)));
+    }
+  }
+}
+
+// ─── Telegram status message ──────────────────────────────────────────────────
+function buildStatusMsg() {
+  if (!claimHistory.length)
+    return `⏳ Henüz claim kaydı yok.\nContract: ${CONTRACT}`;
+
+  const posInCycle = ((claimCount - 1) % CYCLE_SIZE) + 1;
+  const cycleAvg   = claimHistory.slice(0, posInCycle).reduce((s, c) => s + c.usd, 0) / posInCycle;
+  const sEmoji     = streakDir === 'up' ? '🔺' : '🔻';
+
+  const avgLines = [5, 10, 15, 20, 50, 100]
+    .map(n => { const v = calcAvg(claimHistory, n); return v !== null ? `Avg${n}: $${v.toFixed(2)}` : null; })
+    .filter(Boolean).join('\n');
+
+  const last = claimHistory[0];
+  return [
+    `📊 <b>Scratch Card Tracker</b> ${VERSION}`,
+    '',
+    `Son: <code>$${last.usd.toFixed(2)}</code>`,
+    `📍 Döngü: ${posInCycle}/${CYCLE_SIZE} — Avg: $${cycleAvg.toFixed(2)}`,
+    `${sEmoji} Streak: ${streak}`,
+    '',
+    avgLines,
+    '',
+    `🔢 Toplam claim: ${claimCount}`,
+    `📦 <code>${CONTRACT}</code>`,
+  ].join('\n');
+}
+
+// ─── Main ─────────────────────────────────────────────────────────────────────
+async function main() {
+  provider = await getProvider();
+
+  bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+
+  bot.onText(/\/start|\/durum/, (msg) => {
+    bot.sendMessage(msg.chat.id, buildStatusMsg(), { parse_mode: 'HTML' })
+      .catch(e => bot.sendMessage(msg.chat.id, `Hata: ${e.message}`));
   });
+
+  bot.on('polling_error', e => console.error('[TG polling]', e.message));
+
+  console.log(`[${VERSION}] Contract: ${CONTRACT}`);
+
+  await loadHistory(500);
+  lastPollBlock = 0; // reset so pollLoop starts from current
+  await pollLoop();
 }
 
-async function init() {
-  try {
-    provider = await getProvider();
-    await checkContract();
-    await fetchTokenInfo();
-
-    const found = await findPool();
-    if (!found) throw new Error(`Uniswap V3 pool bulunamadı. Contract: ${CONTRACT}`);
-
-    poolAddress = found.address;
-    quoteToken  = found.quoteToken;
-    poolContract = new ethers.Contract(poolAddress, POOL_ABI, provider);
-    token0 = (await poolContract.token0()).toLowerCase();
-    token1 = (await poolContract.token1()).toLowerCase();
-    tokenIsToken0 = token0 === CONTRACT;
-
-    isReady = true;
-    startListener();
-    await fetchHistory();
-    setInterval(() => fetchHistory().catch(console.error), 5 * 60_000);
-
-    console.log(`[READY] ${tokenSymbol}/${quoteToken.name} pool=${poolAddress}`);
-  } catch(e) {
-    initErr = e.message;
-    console.error('[INIT]', e);
-  }
-}
-
-function fmt(n, d=0) {
-  if (!n || isNaN(n)) return 'N/A';
-  if (n >= 1e9) return (n/1e9).toFixed(2)+'B';
-  if (n >= 1e6) return (n/1e6).toFixed(2)+'M';
-  if (n >= 1e3) return (n/1e3).toFixed(2)+'K';
-  return n.toFixed(d);
-}
-function avgOf(n) {
-  const sl = recentSwaps.slice(0, n);
-  if (!sl.length) return null;
-  return sl.reduce((s,v) => s + v.tokensPerDollar, 0) / sl.length;
-}
-
-async function priceMsg() {
-  if (!isReady) throw new Error(initErr || 'Bot hazır değil');
-  const p = await getSpotPriceUsd();
-  const last = recentSwaps[0];
-  return `💎 *${tokenSymbol}* — BASE \`${VERSION}\`\n\n💰 *Spot:* \`$${p.toExponential(4)}\`\n\n🛒 *$1 paketi →* \`${fmt(1/p)} ${tokenSymbol}\`\n🛒 *$5 paketi →* \`${fmt(5/p)} ${tokenSymbol}\`\n\n📊 Son: ${last?fmt(last.tokensPerDollar)+' tok/$1':'yok'}\n🔄 Kayıt: ${recentSwaps.length}\n\n📝 \`${CONTRACT}\``;
-}
-
-async function avgMsg() {
-  if (!isReady) throw new Error(initErr || 'Bot hazır değil');
-  const PER = [5,10,15,20,25,50,100];
-  const cur = recentSwaps[0]?.tokensPerDollar;
-  let msg = `📈 *Paket Ortalamaları* (${tokenSymbol}/$1)\n🔄 ${recentSwaps.length} işlem\n\n`;
-  for (const n of PER) {
-    const avg = avgOf(n);
-    if (avg === null) msg += `⚪ Son ${String(n).padEnd(3)}: yetersiz (${recentSwaps.length}/${n})\n`;
-    else { const e = cur ? (cur >= avg ? '🟢' : '🔴') : '⚪'; msg += `${e} Son ${String(n).padEnd(3)}: \`${fmt(avg)} ${tokenSymbol}\`\n`; }
-  }
-  return msg;
-}
-
-async function fullMsg() {
-  if (!isReady) throw new Error(initErr || 'Bot hazır değil');
-  const p = await getSpotPriceUsd();
-  const PER = [5,10,15,20,25,50,100];
-  const cur = recentSwaps[0]?.tokensPerDollar;
-  let lines = '';
-  for (const n of PER) {
-    const avg = avgOf(n);
-    if (avg === null) lines += `⚪ Son ${String(n).padEnd(3)}: yetersiz\n`;
-    else { const e = cur ? (cur >= avg ? '🟢' : '🔴') : '⚪'; lines += `${e} Son ${String(n).padEnd(3)}: \`${fmt(avg)}\` ($5: \`${fmt(avg*5)}\`)\n`; }
-  }
-  return `💎 *${tokenSymbol}* — BASE \`${VERSION}\`\n\n💰 Spot: \`$${p.toExponential(4)}\`\n🛒 $1→ \`${fmt(1/p)} ${tokenSymbol}\`   🛒 $5→ \`${fmt(5/p)} ${tokenSymbol}\`\n\n────────────────────\n📈 *Paket Ortalamaları*\n${lines}\n🔗 \`${poolAddress}\`\n📝 \`${CONTRACT}\``;
-}
-
-bot.onText(/\/start/, async (msg) => {
-  const id = msg.chat.id;
-  if (!isReady) return bot.sendMessage(id, `⏳ [${VERSION}] Bot başlatılıyor...\n${initErr ? '⚠️ '+initErr : ''}`);
-  bot.sendMessage(id, `🤖 *${tokenSymbol} Tracker* \`${VERSION}\`\n\n📍 Base | 🔗 ${poolAddress?.slice(0,8)}...${poolAddress?.slice(-6)} (${quoteToken?.name})\n📊 ${recentSwaps.length} işlem\n\n/fiyat — Spot & $1/$5\n/ort   — 5/10/15/20/25/50/100 ort.\n/tum   — Hepsi`, { parse_mode: 'Markdown' });
-});
-
-bot.onText(/\/fiyat/, async (msg) => {
-  const id=msg.chat.id, l=await bot.sendMessage(id,'⏳ Fiyat...');
-  try { await bot.editMessageText(await priceMsg(),{chat_id:id,message_id:l.message_id,parse_mode:'Markdown'}); }
-  catch(e){bot.editMessageText(`⚠️ ${e.message}`,{chat_id:id,message_id:l.message_id});}
-});
-bot.onText(/\/ort/, async (msg) => {
-  const id=msg.chat.id, l=await bot.sendMessage(id,'⏳ Ortalamalar...');
-  try { await bot.editMessageText(await avgMsg(),{chat_id:id,message_id:l.message_id,parse_mode:'Markdown'}); }
-  catch(e){bot.editMessageText(`⚠️ ${e.message}`,{chat_id:id,message_id:l.message_id});}
-});
-bot.onText(/\/tum/, async (msg) => {
-  const id=msg.chat.id, l=await bot.sendMessage(id,'⏳ ...');
-  try { await bot.editMessageText(await fullMsg(),{chat_id:id,message_id:l.message_id,parse_mode:'Markdown'}); }
-  catch(e){bot.editMessageText(`⚠️ ${e.message}`,{chat_id:id,message_id:l.message_id});}
-});
-
-bot.on('polling_error', e=>console.error('[polling]',e.message));
-init().catch(console.error);
-console.log(`🤖 ${VERSION} — ${CONTRACT} izleniyor...`);
+main().catch(e => { console.error('[FATAL]', e); process.exit(1); });
