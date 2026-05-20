@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v7';
+const VERSION = 'v7.1';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID = process.env.TELEGRAM_CHANNEL_ID;
 const CONTRACT = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -24,16 +24,17 @@ const RPCS = [
 ].filter(Boolean);
 
 // Known claim() function selectors
-// claim()           0x4e71d92d
-// claim(uint256)    0x379607f5
-// claim(address)    0x1e83409a
-// claimTokens()     0x48c54b9d
-// redeem(uint256)   0x2e7ba6ef
-// scratch()         0xbd66528a
 const CLAIM_SELECTORS = new Set([
-  '0x4e71d92d', '0x379607f5', '0x1e83409a',
-  '0x48c54b9d', '0x2e7ba6ef', '0xbd66528a',
-  '0xdb006a75', '0x96c55175', '0x7d49ec34',
+  '0x4e71d92d', // claim()
+  '0x379607f5', // claim(uint256)
+  '0x1e83409a', // claim(address)
+  '0x48c54b9d', // claimTokens()
+  '0x2e7ba6ef', // redeem(uint256)
+  '0xbd66528a', // scratch()
+  '0xdb006a75', // redeem()
+  '0x96c55175', // claim(uint256,address)
+  '0x7d49ec34', // claim(uint256,bytes32[])
+  '0xae169a50', // claimReward(uint256)
 ]);
 
 const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
@@ -44,16 +45,17 @@ const UNI_FACTORY  = '0x33128a8fC17869897dcE68Ed026d694621f6FDfD';
 const AERO_FACTORY = '0x420DD381b31aEf6683db6B902084cB0FFECe40Da';
 
 // ─── State ───────────────────────────────────────────────────────────────────
-let claimHistory = [];   // most-recent first, max 200
+let claimHistory = [];
 const CYCLE_SIZE = 50;
-let claimCount = 0;      // total claims ever processed
+let claimCount = 0;
 let streak = 0;
-let streakDir = null;    // 'up' | 'down'
+let streakDir = null;
 let processedTxs = new Set();
+let pollingErrCount = 0;
 
 let provider, bot;
 let tokenInfoCache = {};
-let priceCache = {};     // tokenAddr -> { price, at }
+let priceCache = {};
 let ethPrice = 0, ethPriceAt = 0;
 let lastPollBlock = 0;
 
@@ -75,7 +77,6 @@ async function getProvider() {
   throw new Error('Hiçbir RPC bağlanamadı');
 }
 
-// ─── ETH/USD ─────────────────────────────────────────────────────────────────
 async function getEthUsd() {
   if (Date.now() - ethPriceAt < 60_000 && ethPrice > 0) return ethPrice;
   try {
@@ -90,7 +91,6 @@ async function getEthUsd() {
   return ethPrice;
 }
 
-// ─── Token info ───────────────────────────────────────────────────────────────
 async function getTokenInfo(address) {
   const k = address.toLowerCase();
   if (tokenInfoCache[k]) return tokenInfoCache[k];
@@ -101,7 +101,7 @@ async function getTokenInfo(address) {
       { timeout: 6000 }
     );
     if (r.data?.symbol) {
-      symbol   = r.data.symbol;
+      symbol = r.data.symbol;
       decimals = parseInt(r.data.decimals ?? 18);
       tokenInfoCache[k] = { symbol, decimals };
       return tokenInfoCache[k];
@@ -112,13 +112,12 @@ async function getTokenInfo(address) {
     ['function symbol() view returns (string)', 'function decimals() view returns (uint8)'],
     provider
   );
-  try { symbol   = await c.symbol();             } catch (_) {}
-  try { decimals = Number(await c.decimals());   } catch (_) {}
+  try { symbol   = await c.symbol(); } catch (_) {}
+  try { decimals = Number(await c.decimals()); } catch (_) {}
   tokenInfoCache[k] = { symbol, decimals };
   return tokenInfoCache[k];
 }
 
-// ─── Token USD price ─────────────────────────────────────────────────────────
 async function getTokenPriceUsd(address) {
   const k = address.toLowerCase();
   const cached = priceCache[k];
@@ -159,36 +158,38 @@ async function getTokenPriceUsd(address) {
   }
 
   // Aerodrome V2
-  const aeroFactory = new ethers.Contract(
-    AERO_FACTORY,
-    ['function getPair(address,address,bool) view returns (address)'],
-    provider
-  );
-  for (const [quote, qDec, isEth] of [[WETH, 18, true], [USDC, 6, false]]) {
-    for (const stable of [false, true]) {
-      try {
-        const pairAddr = await aeroFactory.getPair(address, quote, stable);
-        if (!pairAddr || pairAddr === ethers.ZeroAddress) continue;
-        const pair = new ethers.Contract(pairAddr, [
-          'function getReserves() view returns (uint112,uint112,uint32)',
-          'function token0() view returns (address)',
-        ], provider);
-        const [res, t0] = await Promise.all([pair.getReserves(), pair.token0()]);
-        const isT0 = t0.toLowerCase() === k;
-        const tokR = Number(ethers.formatUnits(isT0 ? res[0] : res[1], decimals));
-        const quoR = Number(ethers.formatUnits(isT0 ? res[1] : res[0], qDec));
-        if (tokR <= 0 || quoR <= 0) continue;
-        const priceUsd = isEth
-          ? (quoR / tokR) * await getEthUsd()
-          : quoR / tokR;
-        if (priceUsd > 0 && priceUsd < 1e12) {
-          priceCache[k] = { price: priceUsd, at: Date.now() };
-          console.log(`[PRICE] Aerodrome $${priceUsd.toExponential(4)}`);
-          return priceUsd;
-        }
-      } catch (_) {}
+  try {
+    const aeroFactory = new ethers.Contract(
+      AERO_FACTORY,
+      ['function getPair(address,address,bool) view returns (address)'],
+      provider
+    );
+    for (const [quote, qDec, isEth] of [[WETH, 18, true], [USDC, 6, false]]) {
+      for (const stable of [false, true]) {
+        try {
+          const pairAddr = await aeroFactory.getPair(address, quote, stable);
+          if (!pairAddr || pairAddr === ethers.ZeroAddress) continue;
+          const pair = new ethers.Contract(pairAddr, [
+            'function getReserves() view returns (uint112,uint112,uint32)',
+            'function token0() view returns (address)',
+          ], provider);
+          const [res, t0] = await Promise.all([pair.getReserves(), pair.token0()]);
+          const isT0 = t0.toLowerCase() === k;
+          const tokR = Number(ethers.formatUnits(isT0 ? res[0] : res[1], decimals));
+          const quoR = Number(ethers.formatUnits(isT0 ? res[1] : res[0], qDec));
+          if (tokR <= 0 || quoR <= 0) continue;
+          const priceUsd = isEth
+            ? (quoR / tokR) * await getEthUsd()
+            : quoR / tokR;
+          if (priceUsd > 0 && priceUsd < 1e12) {
+            priceCache[k] = { price: priceUsd, at: Date.now() };
+            console.log(`[PRICE] Aerodrome $${priceUsd.toExponential(4)}`);
+            return priceUsd;
+          }
+        } catch (_) {}
+      }
     }
-  }
+  } catch (_) {}
 
   // DexScreener fallback
   try {
@@ -222,7 +223,7 @@ function isClaimInput(data) {
   return CLAIM_SELECTORS.has(data.slice(0, 10).toLowerCase());
 }
 
-// ─── Core: process one claim TX ───────────────────────────────────────────────
+// ─── Process one claim TX ───────────────────────────────────────────────────
 async function processClaimTx(txHash, from, data, blockNum, blockTs) {
   if (processedTxs.has(txHash)) return;
   processedTxs.add(txHash);
@@ -239,7 +240,7 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
 
   const claimer = from.toLowerCase();
 
-  // Collect ERC20 transfers TO the claimer
+  // ERC20 transfers TO claimer
   const received = {};
   for (const log of receipt.logs) {
     if (log.topics[0]?.toLowerCase() !== TRANSFER_TOPIC) continue;
@@ -252,12 +253,12 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
   }
 
   if (!Object.keys(received).length) {
-    console.log(`[SKIP] ${txHash.slice(0, 10)} — transfer bulunamadı`);
+    console.log(`[SKIP ${txHash.slice(0, 10)}] alıcıya transfer yok`);
     return;
   }
 
-  // Find token with highest USD value
-  let bestUsd = 0, bestToken = null, bestHuman = 0;
+  // Pick best (highest USD) token
+  let bestUsd = 0, bestToken = null;
   for (const [addr, rawAmt] of Object.entries(received)) {
     try {
       const info  = await getTokenInfo(addr);
@@ -265,19 +266,17 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
       const price = await getTokenPriceUsd(addr);
       if (!price) continue;
       const usd = human * price;
-      if (usd > bestUsd) { bestUsd = usd; bestHuman = human; bestToken = { addr, ...info, price }; }
+      if (usd > bestUsd) { bestUsd = usd; bestToken = { addr, ...info, price }; }
     } catch (_) {}
   }
 
   if (!bestToken || bestUsd <= 0) {
-    console.log(`[SKIP] ${txHash.slice(0, 10)} — fiyat bulunamadı`);
+    console.log(`[SKIP ${txHash.slice(0, 10)}] fiyat bulunamadı`);
     return;
   }
 
-  // Packet type heuristic ($1 vs $5)
   const packetType = bestUsd >= 2.5 ? '$5' : '$1';
 
-  // Update streak
   if (claimHistory.length > 0) {
     const dir = bestUsd >= claimHistory[0].usd ? 'up' : 'down';
     streak    = dir === streakDir ? streak + 1 : 1;
@@ -286,17 +285,14 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
     streak = 1; streakDir = null;
   }
 
-  // Record
   claimCount++;
   claimHistory.unshift({ usd: bestUsd, ts: blockTs * 1000, hash: txHash, claimer: from });
   if (claimHistory.length > 200) claimHistory.pop();
 
-  // Cycle
   const posInCycle = ((claimCount - 1) % CYCLE_SIZE) + 1;
   const remaining  = CYCLE_SIZE - posInCycle;
   const cycleAvg   = claimHistory.slice(0, posInCycle).reduce((s, c) => s + c.usd, 0) / posInCycle;
 
-  // Moving averages
   const avgLine = [5, 10, 15, 20, 50, 100]
     .map(n => { const v = calcAvg(claimHistory, n); return v !== null ? `Avg${n} $${v.toFixed(2)}` : null; })
     .filter(Boolean)
@@ -327,53 +323,67 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
   }
 }
 
-// ─── getLogs helper (two strategies) ─────────────────────────────────────────
-async function getClaimLogs(fromBlock, toBlock) {
-  // Strategy A: Transfer events FROM the contract (contract holds a separate token)
-  const logsA = await provider.getLogs({
-    fromBlock,
-    toBlock,
-    topics: [TRANSFER_TOPIC, ethers.zeroPadValue(CONTRACT, 32)],
-  }).catch(() => []);
-
-  // Strategy B: Transfer events ON the contract (contract is the token)
-  const logsB = await provider.getLogs({
-    fromBlock,
-    toBlock,
-    address: CONTRACT,
-    topics: [TRANSFER_TOPIC],
-  }).catch(() => []);
-
-  // Deduplicate by txHash
-  const txMap = new Map();
-  for (const log of [...logsA, ...logsB]) {
-    if (!txMap.has(log.transactionHash))
-      txMap.set(log.transactionHash, log.blockNumber);
+// ─── Block scanning (primary live strategy) ─────────────────────────────────────────
+async function scanBlocksForClaimTxs(fromBlock, toBlock) {
+  const found = [];
+  const BATCH = 8;
+  for (let b = fromBlock; b <= toBlock; b += BATCH) {
+    const end = Math.min(b + BATCH - 1, toBlock);
+    const promises = [];
+    for (let i = b; i <= end; i++) {
+      promises.push(provider.getBlock(i, true).catch(() => null));
+    }
+    const blocks = await Promise.all(promises);
+    for (const block of blocks) {
+      if (!block) continue;
+      const txs = block.prefetchedTransactions || [];
+      for (const tx of txs) {
+        if (tx.to?.toLowerCase() !== CONTRACT_LOWER) continue;
+        if (!isClaimInput(tx.data || tx.input || '')) continue;
+        found.push({
+          hash: tx.hash,
+          from: tx.from,
+          data: tx.data || tx.input,
+          blockNum: Number(block.number),
+          blockTs: Number(block.timestamp),
+        });
+      }
+    }
   }
-  return txMap;
+  return found;
 }
 
-// ─── Initial history load ─────────────────────────────────────────────────────
-async function loadHistory(numBlocks = 500) {
-  console.log(`[HISTORY] Son ${numBlocks} blok taranıyor...`);
-  const cur  = await provider.getBlockNumber();
-  const from = Math.max(0, cur - numBlocks);
+// ─── Blockscout API history loader ────────────────────────────────────────────────
+async function loadHistoryViaBlockscout(limit = 150) {
+  console.log('[HISTORY] Blockscout API ile yükleniyor...');
+  try {
+    const r = await axios.get(
+      `https://base.blockscout.com/api/v2/addresses/${CONTRACT}/transactions`,
+      { params: { filter: 'to' }, timeout: 15000 }
+    );
+    const items = r.data?.items || [];
+    console.log(`[HISTORY] Blockscout: ${items.length} TX döndü`);
 
-  const txMap = await getClaimLogs(from, cur);
-  const sorted = [...txMap.entries()].sort((a, b) => a[1] - b[1]); // oldest first
-  console.log(`[HISTORY] ${sorted.length} potansiyel TX`);
+    const claimTxs = items
+      .filter(tx => {
+        const sel = (tx.raw_input || '').slice(0, 10).toLowerCase();
+        return tx.status === 'ok' && CLAIM_SELECTORS.has(sel);
+      })
+      .sort((a, b) => a.block - b.block);
 
-  for (const [txHash, blockNum] of sorted) {
-    try {
-      const tx = await provider.getTransaction(txHash);
-      if (!tx || tx.to?.toLowerCase() !== CONTRACT_LOWER) continue;
-      if (!isClaimInput(tx.data || '')) continue;
-      const block = await provider.getBlock(blockNum);
-      await processClaimTx(txHash, tx.from, tx.data, blockNum, block.timestamp);
-    } catch (_) {}
+    console.log(`[HISTORY] ${claimTxs.length} claim TX işlenecek`);
+
+    for (const tx of claimTxs.slice(0, limit)) {
+      try {
+        const blockTs = Math.floor(new Date(tx.timestamp).getTime() / 1000);
+        const fromAddr = tx.from?.hash || tx.from;
+        if (!fromAddr) continue;
+        await processClaimTx(tx.hash, fromAddr, tx.raw_input, tx.block, blockTs);
+      } catch (e) { console.error('[HISTORY tx]', e.message); }
+    }
+  } catch (e) {
+    console.error('[HISTORY] Blockscout API hatası:', e.message);
   }
-
-  console.log(`[HISTORY] ${claimHistory.length} claim yüklendi`);
 }
 
 // ─── Live poll loop ───────────────────────────────────────────────────────────
@@ -388,26 +398,19 @@ async function pollLoop() {
 
       if (cur > lastPollBlock) {
         const fromB = lastPollBlock + 1;
-        const toB   = Math.min(cur, lastPollBlock + 30);
+        const toB   = Math.min(cur, lastPollBlock + 20);
 
-        const txMap = await getClaimLogs(fromB, toB);
-
-        for (const [txHash, blockNum] of txMap) {
-          if (processedTxs.has(txHash)) continue;
-          try {
-            const tx = await provider.getTransaction(txHash);
-            if (!tx || tx.to?.toLowerCase() !== CONTRACT_LOWER) continue;
-            if (!isClaimInput(tx.data || '')) continue;
-            const block = await provider.getBlock(blockNum);
-            await processClaimTx(txHash, tx.from, tx.data, blockNum, block.timestamp);
-          } catch (e) { console.error(`[TX ${txHash.slice(0, 10)}]`, e.message.slice(0, 80)); }
+        const txs = await scanBlocksForClaimTxs(fromB, toB);
+        for (const tx of txs) {
+          if (processedTxs.has(tx.hash)) continue;
+          await processClaimTx(tx.hash, tx.from, tx.data, tx.blockNum, tx.blockTs);
         }
 
         lastPollBlock = toB;
       }
 
       fails = 0;
-      await new Promise(r => setTimeout(r, 2000));
+      await new Promise(r => setTimeout(r, 2500));
     } catch (e) {
       fails++;
       console.error('[POLL]', e.message.slice(0, 80));
@@ -419,10 +422,10 @@ async function pollLoop() {
   }
 }
 
-// ─── Telegram status message ──────────────────────────────────────────────────
+// ─── Telegram status ─────────────────────────────────────────────────────────────────
 function buildStatusMsg() {
   if (!claimHistory.length)
-    return `⏳ Henüz claim kaydı yok.\nContract: ${CONTRACT}`;
+    return `⏳ Henüz claim kaydı yok.\nContract: ${CONTRACT}\nVersion: ${VERSION}`;
 
   const posInCycle = ((claimCount - 1) % CYCLE_SIZE) + 1;
   const cycleAvg   = claimHistory.slice(0, posInCycle).reduce((s, c) => s + c.usd, 0) / posInCycle;
@@ -458,12 +461,27 @@ async function main() {
       .catch(e => bot.sendMessage(msg.chat.id, `Hata: ${e.message}`));
   });
 
-  bot.on('polling_error', e => console.error('[TG polling]', e.message));
+  bot.on('polling_error', (e) => {
+    if (e.message?.includes('409')) {
+      pollingErrCount++;
+      if (pollingErrCount === 1)
+        console.error('[TG] 409 Conflict — başka bir bot instance aktif! Eski versiyonu durdur.');
+      if (pollingErrCount > 80) {
+        console.error('[TG] 80+ ardalan 409 — process restart için çıkılıyor');
+        process.exit(1);
+      }
+    } else {
+      pollingErrCount = 0;
+      console.error('[TG polling]', e.message);
+    }
+  });
 
   console.log(`[${VERSION}] Contract: ${CONTRACT}`);
 
-  await loadHistory(500);
-  lastPollBlock = 0; // reset so pollLoop starts from current
+  await loadHistoryViaBlockscout(200);
+  console.log(`[HISTORY] ${claimHistory.length} claim hazır`);
+
+  lastPollBlock = 0;
   await pollLoop();
 }
 
