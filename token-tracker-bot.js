@@ -1,242 +1,326 @@
 require('dotenv').config();
 const TelegramBot = require('node-telegram-bot-api');
-const axios = require('axios');
-
-const VERSION = 'v4';
+const { ethers } = require('ethers');
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 if (!TELEGRAM_TOKEN) { console.error('TELEGRAM_BOT_TOKEN eksik!'); process.exit(1); }
 
-const CONTRACT = (process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296').toLowerCase();
+const CONTRACT  = (process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296');
+const RPCS = [
+  'https://base.blockscout.com/api/eth-rpc',
+  process.env.RPC_URL_1,
+  process.env.RPC_URL_2,
+  'https://mainnet.base.org',
+  'https://base-rpc.publicnode.com',
+  'https://base.gateway.tenderly.co',
+].filter(Boolean);
+
+// Base network constants
+const WETH            = '0x4200000000000000000000000000000000000006';
+const USDC            = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
+const UNI_V3_FACTORY  = '0x33128a8fC17869897dcE68Ed026d694621f6FDfD';
+const CHAINLINK_ETHUSD= '0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70';
+
+const FACTORY_ABI  = ['function getPool(address,address,uint24) view returns (address)'];
+const POOL_ABI     = [
+  'event Swap(address indexed sender,address indexed recipient,int256 amount0,int256 amount1,uint160 sqrtPriceX96,uint128 liquidity,int24 tick)',
+  'function token0() view returns (address)',
+  'function token1() view returns (address)',
+  'function slot0() view returns (uint160 sqrtPriceX96,int24 tick,uint16,uint16,uint16,uint8,bool)',
+];
+const ERC20_ABI    = ['function decimals() view returns (uint8)','function symbol() view returns (string)'];
+const CHAINLINK_ABI= ['function latestAnswer() view returns (int256)'];
 
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
-let pairCache = null, priceCacheTime = 0;
-let ohlcvHourly = [], ohlcvHourlyAt = 0;
-const PRICE_TTL = 20_000, OHLCV_TTL = 60_000;
+// State
+let provider, poolContract, poolAddress;
+let token0, token1, tokenIsToken0;
+let tokenDecimals = 18, tokenSymbol = 'TOKEN';
+let quoteToken;           // { address, name, decimals }
+let recentSwaps = [];     // { tokensPerDollar, ts, hash }
+let isReady = false;
+let initErr = null;
+let ethPriceCache = 0, ethPriceCacheAt = 0;
 
-const http = axios.create({ timeout: 15_000 });
-
-const GT_NETWORKS = ['base','eth','bsc','arbitrum','polygon','optimism','avax','fantom','cronos'];
-
-async function gtFindPool() {
-  for (const net of GT_NETWORKS) {
+// ─── RPC ──────────────────────────────────────────────────────────────────────
+async function getProvider() {
+  for (const rpc of RPCS) {
     try {
-      const res = await http.get(
-        `https://api.geckoterminal.com/api/v2/networks/${net}/tokens/${CONTRACT}/pools?page=1`,
-        { headers: { Accept: 'application/json;version=20230302' } }
-      );
-      const pools = res.data?.data || [];
-      if (!pools.length) { console.log(`[GT] ${net}: pool yok`); continue; }
-      const pool = pools.sort((a,b) => (b.attributes?.reserve_in_usd||0)-(a.attributes?.reserve_in_usd||0))[0];
-      const attr = pool.attributes;
-      console.log(`[GT] BULUNDU: ${net} pool=${attr.address} price=${attr.base_token_price_usd}`);
-      return {
-        net, pairAddress: attr.address,
-        baseToken: attr.name?.split(' / ')[0] || 'TOKEN',
-        priceUsd: parseFloat(attr.base_token_price_usd||0),
-        liqUsd:   parseFloat(attr.reserve_in_usd||0),
-        vol24h:   parseFloat(attr.volume_usd?.h24||0),
-        fdv:      parseFloat(attr.fdv_usd||0),
-        c1h:  parseFloat(attr.price_change_percentage?.h1||0),
-        c6h:  parseFloat(attr.price_change_percentage?.h6||0),
-        c24h: parseFloat(attr.price_change_percentage?.h24||0),
-        txBuys:  attr.transactions?.h24?.buys||0,
-        txSells: attr.transactions?.h24?.sells||0,
-      };
-    } catch(e) { console.log(`[GT] ${net}: hata - ${e.message}`); }
+      const p = new ethers.JsonRpcProvider(rpc);
+      await Promise.race([p.getBlockNumber(), new Promise((_,r)=>setTimeout(()=>r(new Error('timeout')),5000))]);
+      console.log(`[RPC] OK: ${rpc}`);
+      return p;
+    } catch(e) { console.log(`[RPC] fail ${rpc}: ${e.message}`); }
+  }
+  throw new Error('Hiçbir RPC bağlanamadı');
+}
+
+// ─── ETH/USD fiyatı (Chainlink) ───────────────────────────────────────────────
+async function getEthPrice() {
+  if (Date.now() - ethPriceCacheAt < 60_000 && ethPriceCache > 0) return ethPriceCache;
+  try {
+    const cl = new ethers.Contract(CHAINLINK_ETHUSD, CHAINLINK_ABI, provider);
+    const ans = await cl.latestAnswer();
+    ethPriceCache = Number(ans) / 1e8;
+    ethPriceCacheAt = Date.now();
+    console.log(`[ETH] $${ethPriceCache}`);
+    return ethPriceCache;
+  } catch(e) {
+    console.warn('[ETH] Chainlink hata, fallback 3000:', e.message);
+    return ethPriceCache || 3000;
+  }
+}
+
+// ─── Pool bul ─────────────────────────────────────────────────────────────────
+async function findPool() {
+  const factory = new ethers.Contract(UNI_V3_FACTORY, FACTORY_ABI, provider);
+  const quotes = [
+    { address: WETH, name: 'WETH', decimals: 18 },
+    { address: USDC, name: 'USDC', decimals: 6  },
+  ];
+  for (const qt of quotes) {
+    for (const fee of [100, 500, 3000, 10000]) {
+      try {
+        const addr = await factory.getPool(CONTRACT, qt.address, fee);
+        if (addr && addr !== ethers.ZeroAddress) {
+          console.log(`[POOL] ${addr} (${qt.name} fee=${fee})`);
+          return { address: addr, quoteToken: qt };
+        }
+      } catch(_) {}
+    }
   }
   return null;
 }
 
-async function dsFindPool() {
-  const res = await http.get(`https://api.dexscreener.com/latest/dex/tokens/${CONTRACT}`);
-  const pairs = res.data?.pairs || [];
-  if (!pairs.length) { console.log('[DS] pair yok'); return null; }
-  const p = pairs.sort((a,b)=>(b.liquidity?.usd||0)-(a.liquidity?.usd||0))[0];
-  const chainMap = {ethereum:'eth',bsc:'bsc',base:'base',arbitrum:'arbitrum',polygon:'polygon'};
-  const net = chainMap[p.chainId] || p.chainId;
-  console.log(`[DS] BULUNDU: ${p.chainId} pair=${p.pairAddress}`);
-  return {
-    net, pairAddress: p.pairAddress,
-    baseToken: p.baseToken?.symbol||'TOKEN',
-    priceUsd: parseFloat(p.priceUsd||0),
-    liqUsd:   parseFloat(p.liquidity?.usd||0),
-    vol24h:   parseFloat(p.volume?.h24||0),
-    fdv:      parseFloat(p.fdv||0),
-    c1h: p.priceChange?.h1||0, c6h: p.priceChange?.h6||0, c24h: p.priceChange?.h24||0,
-    txBuys: p.txns?.h24?.buys||0, txSells: p.txns?.h24?.sells||0,
-  };
-}
+// ─── Swap → tokens/$1 hesapla ─────────────────────────────────────────────────
+async function swapToRate(amount0, amount1) {
+  const tokenAmt = Math.abs(Number(ethers.formatUnits(
+    tokenIsToken0 ? amount0 : amount1, tokenDecimals
+  )));
+  const quoteAmt = Math.abs(Number(ethers.formatUnits(
+    tokenIsToken0 ? amount1 : amount0, quoteToken.decimals
+  )));
+  if (quoteAmt === 0) return null;
 
-async function fetchPair() {
-  const now = Date.now();
-  if (pairCache && now - priceCacheTime < PRICE_TTL) return pairCache;
-  let pair = await gtFindPool().catch(e => { console.log('[GT] catch:',e.message); return null; });
-  if (!pair) pair = await dsFindPool().catch(e => { console.log('[DS] catch:',e.message); return null; });
-  if (!pair) throw new Error(`[${VERSION}] Hiçbir DEX'te pair bulunamadı.\nContract: ${CONTRACT}`);
-  pairCache = pair; priceCacheTime = now;
-  return pair;
-}
-
-async function fetchOHLCV(net, pairAddress, tf='hour', limit=100) {
-  if (tf==='hour' && ohlcvHourly.length && Date.now()-ohlcvHourlyAt < OHLCV_TTL) return ohlcvHourly;
-  const res = await http.get(
-    `https://api.geckoterminal.com/api/v2/networks/${net}/pools/${pairAddress}/ohlcv/${tf}?limit=${limit}`,
-    { headers: { Accept: 'application/json;version=20230302' } }
-  );
-  const list = (res.data?.data?.attributes?.ohlcv_list||[]).reverse();
-  if (tf==='hour') { ohlcvHourly=list; ohlcvHourlyAt=Date.now(); }
-  return list;
-}
-
-function ma(closes,p) {
-  if (closes.length<p) return null;
-  return closes.slice(-p).reduce((s,v)=>s+v,0)/p;
-}
-function fp(p) {
-  if (!p||isNaN(p)) return 'N/A';
-  if (p<0.000001) return p.toExponential(4);
-  if (p<0.0001)   return p.toFixed(9);
-  if (p<0.01)     return p.toFixed(7);
-  if (p<1)        return p.toFixed(6);
-  return p.toFixed(4);
-}
-function fmt(n,d=2) {
-  if (!n||isNaN(n)) return 'N/A';
-  return Number(n).toLocaleString('en-US',{maximumFractionDigits:d});
-}
-function ta(price,dollars) {
-  if (!price) return 'N/A';
-  const amt=dollars/price;
-  if (amt>=1e6) return fmt(amt/1e6,2)+'M';
-  if (amt>=1e3) return fmt(amt/1e3,2)+'K';
-  return fmt(amt,0);
-}
-function dp(cur,ref) {
-  if (!ref) return '?';
-  const d=((cur-ref)/ref)*100;
-  return (d>=0?'+':'')+d.toFixed(2)+'%';
-}
-const ar=(c,r)=>c>=r?'🟢':'🔴';
-
-async function buildPriceMsg() {
-  const p=await fetchPair();
-  const s=v=>v>=0?'+':'';
-  return `💎 *${p.baseToken}* — ${p.net.toUpperCase()}\n\n💰 *Fiyat:* \`$${fp(p.priceUsd)}\`\n${p.c1h>=0?'🟢':'🔴'}  1s: ${s(p.c1h)}${Number(p.c1h).toFixed(2)}%\n${p.c6h>=0?'🟢':'🔴'}  6s: ${s(p.c6h)}${Number(p.c6h).toFixed(2)}%\n${p.c24h>=0?'🟢':'🔴'} 24s: ${s(p.c24h)}${Number(p.c24h).toFixed(2)}%\n\n🛒 *$1  →* ${ta(p.priceUsd,1)} ${p.baseToken}\n🛒 *$5  →* ${ta(p.priceUsd,5)} ${p.baseToken}\n\n📊 Hacim: $${fmt(p.vol24h)}\n💧 Liq: $${fmt(p.liqUsd)}\n🏦 FDV: $${fmt(p.fdv)}\n🔄 TX: ${fmt(p.txBuys+p.txSells,0)}\n\n📝 \`${CONTRACT}\``;
-}
-
-async function buildMAMsg() {
-  const PERIODS=[5,10,15,20,25,50,100];
-  const p=await fetchPair();
-  let closes=[];
-  try { closes=(await fetchOHLCV(p.net,p.pairAddress,'hour',100)).map(c=>parseFloat(c[4])); } catch(_){}
-  let msg=`📈 *Hareketli Ortalamalar* (${p.baseToken} — saatlik)\n💰 Güncel: \`$${fp(p.priceUsd)}\`\n\n`;
-  for (const per of PERIODS) {
-    const avg=ma(closes,per);
-    msg+=avg===null?`⚪ MA${String(per).padEnd(3)} — yetersiz veri\n`:`${ar(p.priceUsd,avg)} MA${String(per).padEnd(3)} \`$${fp(avg)}\`  (${dp(p.priceUsd,avg)})\n`;
+  let usdValue;
+  if (quoteToken.address.toLowerCase() === WETH.toLowerCase()) {
+    usdValue = quoteAmt * (await getEthPrice());
+  } else {
+    usdValue = quoteAmt; // USDC ≈ $1
   }
-  return msg+`\n_Veri: ${closes.length} saatlik mum_`;
+  if (usdValue === 0) return null;
+  return tokenAmt / usdValue; // kaç token / $1
 }
 
-async function buildCycleMsg() {
-  const p=await fetchPair();
-  let closes=[];
-  try { closes=(await fetchOHLCV(p.net,p.pairAddress,'day',100)).map(c=>parseFloat(c[4])); } catch(_){}
-  const cycles=[{label:'Kısa  (7G)',days:7},{label:'Orta  (14G)',days:14},{label:'Uzun  (25G)',days:25},{label:'Makro (50G)',days:50}];
-  let msg=`🔄 *Döngü Ortalamaları* (${p.baseToken} — günlük)\n💰 Güncel: \`$${fp(p.priceUsd)}\`\n\n`;
-  for (const {label,days} of cycles) {
-    const avg=ma(closes,days);
-    msg+=avg===null?`⚪ ${label} — yetersiz veri\n`:`${ar(p.priceUsd,avg)} ${label}: \`$${fp(avg)}\`  (${dp(p.priceUsd,avg)})\n`;
+// ─── Güncel spot fiyatı (slot0'dan) ──────────────────────────────────────────
+async function getSpotPriceUsd() {
+  const slot0 = await poolContract.slot0();
+  const sqrtP = Number(slot0.sqrtPriceX96);
+  const price96sq = (sqrtP / 2**96) ** 2;
+
+  let tokenPriceInQuote;
+  if (tokenIsToken0) {
+    // price = token1/token0, adjust decimals
+    tokenPriceInQuote = price96sq * (10**quoteToken.decimals) / (10**tokenDecimals);
+  } else {
+    tokenPriceInQuote = (1 / price96sq) * (10**tokenDecimals) / (10**quoteToken.decimals);
   }
-  if (closes.length) {
-    const ath=Math.max(...closes,p.priceUsd), atl=Math.min(...closes.filter(x=>x>0),p.priceUsd);
-    msg+=`\n📌 ATH: \`$${fp(ath)}\`  (${dp(p.priceUsd,ath)})\n📌 ATL: \`$${fp(atl)}\`  (${dp(p.priceUsd,atl)})\n`;
+
+  if (quoteToken.address.toLowerCase() === WETH.toLowerCase()) {
+    return tokenPriceInQuote * (await getEthPrice());
   }
-  return msg+`\n_Veri: ${closes.length} günlük mum_`;
+  return tokenPriceInQuote;
 }
 
-async function buildFullMsg() {
-  const PERIODS=[5,10,15,20,25,50,100];
-  const p=await fetchPair();
-  let hC=[],dC=[];
-  try { hC=(await fetchOHLCV(p.net,p.pairAddress,'hour',100)).map(c=>parseFloat(c[4])); } catch(_){}
-  try { dC=(await fetchOHLCV(p.net,p.pairAddress,'day',100)).map(c=>parseFloat(c[4])); } catch(_){}
-  const s=v=>v>=0?'+':'';
-  let maL=''; for(const per of PERIODS){const avg=ma(hC,per);maL+=avg!==null?`${ar(p.priceUsd,avg)} MA${String(per).padEnd(3)} \`$${fp(avg)}\`  (${dp(p.priceUsd,avg)})\n`:`⚪ MA${per} — yetersiz veri\n`;}
-  let cyL=''; for(const {label,days} of [{label:'Kısa 7G',days:7},{label:'Orta 14G',days:14},{label:'Uzun 25G',days:25},{label:'Makro 50G',days:50}]){const avg=ma(dC,days);cyL+=avg!==null?`${ar(p.priceUsd,avg)} ${label}: \`$${fp(avg)}\`  (${dp(p.priceUsd,avg)})\n`:`⚪ ${label} — yetersiz veri\n`;}
-  return `💎 *${p.baseToken}* — ${p.net.toUpperCase()}\n\n💰 *Fiyat:* \`$${fp(p.priceUsd)}\`\n${p.c1h>=0?'🟢':'🔴'} 1s: ${s(p.c1h)}${Number(p.c1h).toFixed(2)}%   ${p.c24h>=0?'🟢':'🔴'} 24s: ${s(p.c24h)}${Number(p.c24h).toFixed(2)}%\n\n🛒 *$1→* ${ta(p.priceUsd,1)} ${p.baseToken}   |   *$5→* ${ta(p.priceUsd,5)} ${p.baseToken}\n📊 Hacim: $${fmt(p.vol24h)}   💧 Liq: $${fmt(p.liqUsd)}\n\n────────────────────\n📈 *Hareketli Ortalamalar*\n${maL}\n🔄 *Döngü Ortalamaları*\n${cyL}\n📝 \`${CONTRACT}\``;
+// ─── Geçmiş swapları çek ─────────────────────────────────────────────────────
+async function fetchHistory() {
+  try {
+    const cur   = await provider.getBlockNumber();
+    const from  = cur - 2000; // ~7 dakika
+    const evts  = await poolContract.queryFilter(poolContract.filters.Swap(), from, cur);
+    console.log(`[HISTORY] ${evts.length} event`);
+
+    const swaps = [];
+    for (const e of evts.reverse()) {
+      const { amount0, amount1 } = e.args;
+      const isBuy = tokenIsToken0 ? amount0 < 0n : amount1 < 0n;
+      if (!isBuy) continue;
+      const rate = await swapToRate(amount0, amount1);
+      if (rate && rate > 0) swaps.push({ tokensPerDollar: rate, ts: Date.now(), hash: e.transactionHash });
+    }
+    // birleştir, en fazla 100 tut
+    recentSwaps = [...swaps, ...recentSwaps]
+      .filter((v, i, a) => a.findIndex(x => x.hash === v.hash) === i)
+      .slice(0, 100);
+    console.log(`[HISTORY] ${recentSwaps.length} buy kayıtlı`);
+  } catch(e) { console.error('[HISTORY]', e.message); }
 }
 
-// ── /debug: ham API yanıtlarını göster ───────────────────────────────────────
-bot.onText(/\/debug/, async (msg) => {
-  const chatId = msg.chat.id;
-  const l = await bot.sendMessage(chatId, `⏳ [${VERSION}] Debug çalıştırılıyor…`);
-  let out = `🔧 *Debug* \`${VERSION}\`\n📝 \`${CONTRACT}\`\n\n`;
-
-  // GeckoTerminal — base dene
-  for (const net of ['base','eth','bsc','arbitrum']) {
+// ─── Canlı dinleyici ──────────────────────────────────────────────────────────
+function startListener() {
+  poolContract.on('Swap', async (sender, recipient, amount0, amount1) => {
     try {
-      const res = await http.get(
-        `https://api.geckoterminal.com/api/v2/networks/${net}/tokens/${CONTRACT}/pools?page=1`,
-        { headers: { Accept: 'application/json;version=20230302' } }
-      );
-      const pools = res.data?.data || [];
-      out += `🌐 GT/${net}: ${pools.length} pool`;
-      if (pools.length) out += ` | liq=$${pools[0].attributes?.reserve_in_usd||0}`;
-      out += '\n';
-    } catch(e) { out += `🌐 GT/${net}: HATA — ${e.message}\n`; }
+      const isBuy = tokenIsToken0 ? amount0 < 0n : amount1 < 0n;
+      if (!isBuy) return;
+      const rate = await swapToRate(amount0, amount1);
+      if (!rate || rate <= 0) return;
+      recentSwaps.unshift({ tokensPerDollar: rate, ts: Date.now(), hash: null });
+      if (recentSwaps.length > 100) recentSwaps.pop();
+      console.log(`[SWAP] ${rate.toFixed(0)} token/$1`);
+    } catch(e) { console.error('[SWAP]', e.message); }
+  });
+}
+
+// ─── Başlat ───────────────────────────────────────────────────────────────────
+async function init() {
+  try {
+    provider = await getProvider();
+    const erc20 = new ethers.Contract(CONTRACT, ERC20_ABI, provider);
+    [tokenDecimals, tokenSymbol] = await Promise.all([erc20.decimals(), erc20.symbol()]);
+    console.log(`[TOKEN] ${tokenSymbol} decimals=${tokenDecimals}`);
+
+    const found = await findPool();
+    if (!found) throw new Error(`Uniswap V3'te pool bulunamadı. Contract doğru mu?`);
+
+    poolAddress   = found.address;
+    quoteToken    = found.quoteToken;
+    poolContract  = new ethers.Contract(poolAddress, POOL_ABI, provider);
+    token0        = (await poolContract.token0()).toLowerCase();
+    token1        = (await poolContract.token1()).toLowerCase();
+    tokenIsToken0 = token0 === CONTRACT.toLowerCase();
+
+    console.log(`[POOL] token0=${token0} tokenIsToken0=${tokenIsToken0}`);
+
+    isReady = true;
+    startListener();
+    await fetchHistory();
+
+    setInterval(() => fetchHistory().catch(console.error), 5 * 60_000);
+    console.log(`[READY] ${tokenSymbol}/${quoteToken.name} pool=${poolAddress}`);
+  } catch(e) {
+    initErr = e.message;
+    console.error('[INIT ERROR]', e.message);
+  }
+}
+
+// ─── Format ───────────────────────────────────────────────────────────────────
+function fmt(n, d = 0) {
+  if (!n || isNaN(n)) return 'N/A';
+  if (n >= 1e9) return (n/1e9).toFixed(2)+'B';
+  if (n >= 1e6) return (n/1e6).toFixed(2)+'M';
+  if (n >= 1e3) return (n/1e3).toFixed(2)+'K';
+  return n.toFixed(d);
+}
+
+function avgOf(n) {
+  const sl = recentSwaps.slice(0, n);
+  if (!sl.length) return null;
+  return sl.reduce((s, v) => s + v.tokensPerDollar, 0) / sl.length;
+}
+
+// ─── Mesajlar ─────────────────────────────────────────────────────────────────
+async function priceMsg() {
+  if (!isReady) throw new Error(initErr || 'Bot hazır değil, lütfen bekleyin');
+  const priceUsd = await getSpotPriceUsd();
+  const t1 = fmt(1 / priceUsd);
+  const t5 = fmt(5 / priceUsd);
+  const last = recentSwaps[0];
+  return (
+    `💎 *${tokenSymbol}* — BASE\n\n` +
+    `💰 *Spot:* \`$${priceUsd.toExponential(4)}\`\n\n` +
+    `🛒 *$1 paketi →* \`${t1} ${tokenSymbol}\`\n` +
+    `🛒 *$5 paketi →* \`${t5} ${tokenSymbol}\`\n\n` +
+    `📊 Son işlem: ${last ? fmt(last.tokensPerDollar)+' token/$1' : 'yok'}\n` +
+    `🔄 Kayıtlı işlem: ${recentSwaps.length}\n\n` +
+    `📝 \`${CONTRACT}\``
+  );
+}
+
+async function avgMsg() {
+  if (!isReady) throw new Error(initErr || 'Bot hazır değil');
+  const PERIODS = [5,10,15,20,25,50,100];
+  const cur = recentSwaps[0]?.tokensPerDollar;
+  let msg = `📈 *Paket Ortalamaları* (${tokenSymbol} / $1)\n🔄 Kayıtlı: ${recentSwaps.length} işlem\n\n`;
+  for (const n of PERIODS) {
+    const avg = avgOf(n);
+    if (avg === null) {
+      msg += `⚪ Son ${String(n).padEnd(3)}: yetersiz veri (${recentSwaps.length}/${n})\n`;
+    } else {
+      const e = cur ? (cur >= avg ? '🟢' : '🔴') : '⚪';
+      msg += `${e} Son ${String(n).padEnd(3)}: \`${fmt(avg)} ${tokenSymbol}\`\n`;
+    }
+  }
+  return msg;
+}
+
+async function fullMsg() {
+  if (!isReady) throw new Error(initErr || 'Bot hazır değil');
+  const priceUsd = await getSpotPriceUsd();
+  const t1 = fmt(1 / priceUsd);
+  const t5 = fmt(5 / priceUsd);
+  const PERIODS = [5,10,15,20,25,50,100];
+  const cur = recentSwaps[0]?.tokensPerDollar;
+
+  let avgLines = '';
+  for (const n of PERIODS) {
+    const avg = avgOf(n);
+    if (avg === null) {
+      avgLines += `⚪ Son ${String(n).padEnd(3)}: yetersiz (${recentSwaps.length}/${n})\n`;
+    } else {
+      const e = cur ? (cur >= avg ? '🟢' : '🔴') : '⚪';
+      avgLines += `${e} Son ${String(n).padEnd(3)}: \`${fmt(avg)}\` token/$1   ($5: \`${fmt(avg*5)}\`)\n`;
+    }
   }
 
-  // DexScreener
-  try {
-    const res = await http.get(`https://api.dexscreener.com/latest/dex/tokens/${CONTRACT}`);
-    const pairs = res.data?.pairs || [];
-    out += `\n🟡 DS: ${pairs.length} pair`;
-    if (pairs.length) out += ` | chain=${pairs[0].chainId} liq=$${pairs[0].liquidity?.usd||0}`;
-    out += '\n';
-  } catch(e) { out += `\n🟡 DS: HATA — ${e.message}\n`; }
+  return (
+    `💎 *${tokenSymbol}* — BASE\n\n` +
+    `💰 *Spot:* \`$${priceUsd.toExponential(4)}\`\n\n` +
+    `🛒 *$1 →* \`${t1} ${tokenSymbol}\`\n` +
+    `🛒 *$5 →* \`${t5} ${tokenSymbol}\`\n\n` +
+    `────────────────────\n` +
+    `📈 *Paket Ortalamaları*\n${avgLines}\n` +
+    `🔗 Pool: \`${poolAddress}\`\n` +
+    `📝 \`${CONTRACT}\``
+  );
+}
 
-  await bot.editMessageText(out, { chat_id: chatId, message_id: l.message_id, parse_mode: 'Markdown' });
-});
-
+// ─── Komutlar ─────────────────────────────────────────────────────────────────
 bot.onText(/\/start/, async (msg) => {
-  const chatId = msg.chat.id;
-  try {
-    const p = await fetchPair();
-    await bot.sendMessage(chatId,
-      `🤖 *Token Tracker Bot* \`${VERSION}\`\n\n📍 *Token:* ${p.baseToken} (${p.net.toUpperCase()})\n📝 \`${CONTRACT}\`\n\n📋 *Komutlar:*\n/fiyat — Anlık fiyat & $1/$5 alım\n/ort   — Hareketli ortalamalar (MA5…100)\n/dongu — Döngü ortalamaları\n/tum   — Tüm veriler\n/debug — API tanı (hata ayıklama)`,
-      { parse_mode: 'Markdown' }
-    );
-  } catch(err) { bot.sendMessage(chatId, `⚠️ [${VERSION}] ${err.message}`); }
+  const id = msg.chat.id;
+  if (!isReady) return bot.sendMessage(id, `⏳ Bot başlatılıyor...\n${initErr ? '⚠️ '+initErr : 'Lütfen 10-20 saniye bekleyin.'}`);
+  bot.sendMessage(id,
+    `🤖 *${tokenSymbol} Tracker*\n\n` +
+    `📍 Base Network\n` +
+    `🔗 Pool: \`${poolAddress?.slice(0,8)}...${poolAddress?.slice(-6)}\` (${quoteToken?.name})\n` +
+    `📊 ${recentSwaps.length} işlem kayıtlı\n\n` +
+    `📋 *Komutlar:*\n` +
+    `/fiyat — Spot fiyat & $1/$5 paket\n` +
+    `/ort   — Son 5/10/15/20/25/50/100 işlem ortalaması\n` +
+    `/tum   — Her şey tek mesajda`,
+    { parse_mode: 'Markdown' }
+  );
 });
 
 bot.onText(/\/fiyat/, async (msg) => {
-  const chatId=msg.chat.id, l=await bot.sendMessage(chatId,'⏳ Fiyat alınıyor…');
-  try { await bot.editMessageText(await buildPriceMsg(),{chat_id:chatId,message_id:l.message_id,parse_mode:'Markdown'}); }
-  catch(err){bot.editMessageText(`⚠️ ${err.message}`,{chat_id:chatId,message_id:l.message_id});}
+  const id=msg.chat.id, l=await bot.sendMessage(id,'⏳ Fiyat alınıyor...');
+  try { await bot.editMessageText(await priceMsg(),{chat_id:id,message_id:l.message_id,parse_mode:'Markdown'}); }
+  catch(e){bot.editMessageText(`⚠️ ${e.message}`,{chat_id:id,message_id:l.message_id});}
 });
 
 bot.onText(/\/ort/, async (msg) => {
-  const chatId=msg.chat.id, l=await bot.sendMessage(chatId,'⏳ Ortalamalar…');
-  try { await bot.editMessageText(await buildMAMsg(),{chat_id:chatId,message_id:l.message_id,parse_mode:'Markdown'}); }
-  catch(err){bot.editMessageText(`⚠️ ${err.message}`,{chat_id:chatId,message_id:l.message_id});}
-});
-
-bot.onText(/\/dongu/, async (msg) => {
-  const chatId=msg.chat.id, l=await bot.sendMessage(chatId,'⏳ Döngü…');
-  try { await bot.editMessageText(await buildCycleMsg(),{chat_id:chatId,message_id:l.message_id,parse_mode:'Markdown'}); }
-  catch(err){bot.editMessageText(`⚠️ ${err.message}`,{chat_id:chatId,message_id:l.message_id});}
+  const id=msg.chat.id, l=await bot.sendMessage(id,'⏳ Ortalamalar...');
+  try { await bot.editMessageText(await avgMsg(),{chat_id:id,message_id:l.message_id,parse_mode:'Markdown'}); }
+  catch(e){bot.editMessageText(`⚠️ ${e.message}`,{chat_id:id,message_id:l.message_id});}
 });
 
 bot.onText(/\/tum/, async (msg) => {
-  const chatId=msg.chat.id, l=await bot.sendMessage(chatId,'⏳ Tüm veriler…');
-  try { await bot.editMessageText(await buildFullMsg(),{chat_id:chatId,message_id:l.message_id,parse_mode:'Markdown'}); }
-  catch(err){bot.editMessageText(`⚠️ ${err.message}`,{chat_id:chatId,message_id:l.message_id});}
+  const id=msg.chat.id, l=await bot.sendMessage(id,'⏳ Yükleniyor...');
+  try { await bot.editMessageText(await fullMsg(),{chat_id:id,message_id:l.message_id,parse_mode:'Markdown'}); }
+  catch(e){bot.editMessageText(`⚠️ ${e.message}`,{chat_id:id,message_id:l.message_id});}
 });
 
-bot.on('polling_error', err=>console.error('[polling]',err.message));
+bot.on('polling_error', e=>console.error('[polling]',e.message));
 
-console.log(`🤖 Token Tracker Bot ${VERSION} başlatıldı!`);
-console.log(`📍 Contract : ${CONTRACT}`);
-console.log(`🔍 Ağlar    : ${GT_NETWORKS.join(', ')}`);
+init().catch(console.error);
+console.log(`🤖 ${CONTRACT} tracker başlatılıyor...`);

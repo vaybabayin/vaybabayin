@@ -1,17 +1,11 @@
 {
   "name": "token-tracker-bot",
-  "version": "1.0.0",
-  "description": "Telegram token tracker bot with MA and cycle averages",
+  "version": "5.0.0",
   "main": "token-tracker-bot.js",
-  "scripts": {
-    "start": "node token-tracker-bot.js"
-  },
-  "engines": {
-    "node": ">=18"
-  },
+  "scripts": { "start": "node token-tracker-bot.js" },
+  "engines": { "node": ">=18" },
   "dependencies": {
     "node-telegram-bot-api": "^0.66.0",
-    "axios": "^1.7.2",
     "ethers": "^6.13.1",
     "dotenv": "^16.4.5"
   }
