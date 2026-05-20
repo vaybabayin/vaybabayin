@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v9';
+const VERSION = 'v9.1';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -25,13 +25,13 @@ const RPCS = [
   'https://base.blockscout.com/api/eth-rpc',
 ].filter(Boolean);
 
-// Tier config — tier decoded from calldata field #1 (uint8)
+// Tier config — $1 (opal) ve $5 (jade) tam bildirim; diğer tierlar kısa spam
 const TIER_INFO = {
-  1: { name: 'opal', emoji: '\u{1F48E}', nominalUsd: 1,  target: SC1_TARGET },
-  2: { name: 'jade', emoji: '\u{1F3B1}', nominalUsd: 5,  target: SC5_TARGET },
+  1: { name: 'opal', emoji: '💎', nominalUsd: 1, target: SC1_TARGET },
+  2: { name: 'jade', emoji: '🎱', nominalUsd: 5, target: SC5_TARGET },
 };
 function getTierInfo(t) {
-  return TIER_INFO[t] || { name: `tier${t}`, emoji: '\u{1F4E6}', nominalUsd: t, target: 100 };
+  return TIER_INFO[t] || { name: `tier${t}`, emoji: '📦', nominalUsd: t, target: 100 };
 }
 
 const CLAIM_SELECTORS = new Set([
@@ -41,7 +41,7 @@ const CLAIM_SELECTORS = new Set([
 ]);
 
 // claim(uint64 batchId, uint8 tier, uint256 seed, uint256 nonce, uint256 deadline)
-// 0x(2) + selector(8) + batchId(64) + tier(64) + seed(64) + nonce(64) + deadline(64) = 330
+// 0x(2)+selector(8)+batchId(64)+tier(64)+seed(64)+nonce(64)+deadline(64) = 330 chars
 function isClaimInput(data) {
   if (!data || data.length < 10) return false;
   if (CLAIM_SELECTORS.has(data.slice(0, 10).toLowerCase())) return true;
@@ -51,7 +51,7 @@ function isClaimInput(data) {
 
 function decodeTier(data) {
   if (!data || data.length !== 330) return null;
-  const t = parseInt(data.slice(74, 138), 16); // offset: 10(sel)+64(batchId)=74
+  const t = parseInt(data.slice(74, 138), 16); // offset: 10(sel)+64(batchId)
   return (t >= 1 && t <= 20) ? t : null;
 }
 
@@ -63,23 +63,14 @@ const UNI_FACTORY      = '0x33128a8fC17869897dcE68Ed026d694621f6FDfD';
 const AERO_FACTORY     = '0x420DD381b31aEf6683db6B902084cB0FFECe40Da';
 const CYCLE_SIZE       = 50;
 
-// ─ Per-tier state ───────────────────────────────────────────────────────────────────
 const tierStates = {};
 function ts(tier) {
   if (!tierStates[tier])
-    tierStates[tier] = {
-      history: [],
-      count: 0,        // total blockchain claims processed
-      sessionCount: 0, // user-set + auto-incremented; shown in /start
-      streak: 0,
-      streakDir: null,
-    };
+    tierStates[tier] = { history: [], count: 0, sessionCount: 0, streak: 0, streakDir: null };
   return tierStates[tier];
 }
 
-// Conversation state for /start interactive flow
-const conversations = {}; // chatId -> { step, data }
-
+const conversations = {};
 let processedTxs = new Set();
 let pollingErrCount = 0;
 let provider, bot;
@@ -88,15 +79,12 @@ let priceCache = {};
 let ethPrice = 0, ethPriceAt = 0;
 let lastPollBlock = 0;
 
-// ─ RPC / price helpers (unchanged) ──────────────────────────────────────────────
 async function getProvider() {
   for (const rpc of RPCS) {
     try {
       const p = new ethers.JsonRpcProvider(rpc);
-      await Promise.race([
-        p.getBlockNumber(),
-        new Promise((_, r) => setTimeout(() => r(new Error('timeout')), 5000)),
-      ]);
+      await Promise.race([p.getBlockNumber(),
+        new Promise((_, r) => setTimeout(() => r(new Error('timeout')), 5000))]);
       console.log(`[RPC ✓] ${rpc}`);
       return p;
     } catch (e) { console.log(`[RPC ✗] ${e.message.slice(0, 70)}`); }
@@ -139,7 +127,6 @@ async function getTokenPriceUsd(address) {
   const cached = priceCache[k];
   if (cached && Date.now() - cached.at < 60_000) return cached.price;
   const { decimals } = await getTokenInfo(address);
-
   const uniFactory = new ethers.Contract(UNI_FACTORY,
     ['function getPool(address,address,uint24) view returns (address)'], provider);
   for (const [quote, qDec, isEth] of [[WETH, 18, true], [USDC, 6, false]]) {
@@ -194,7 +181,6 @@ async function getTokenPriceUsd(address) {
   return null;
 }
 
-// ─ Core helpers ──────────────────────────────────────────────────────────────────────
 function calcAvg(arr, n) {
   if (arr.length < n) return null;
   return arr.slice(0, n).reduce((s, v) => s + v.usd, 0) / n;
@@ -206,7 +192,13 @@ function overallAvg(tierNum) {
   return h.reduce((s, c) => s + c.usd, 0) / h.length;
 }
 
-// ─ Process one claim TX ────────────────────────────────────────────────────────────
+async function sendNotification(msg) {
+  if (!CHANNEL_ID) return;
+  try {
+    await bot.sendMessage(CHANNEL_ID, msg, { parse_mode: 'HTML', disable_web_page_preview: true });
+  } catch (e) { console.error('[TG send]', e.message); }
+}
+
 async function processClaimTx(txHash, from, data, blockNum, blockTs) {
   if (processedTxs.has(txHash)) return;
   processedTxs.add(txHash);
@@ -250,7 +242,6 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
   const tierInfo = getTierInfo(tier);
   const state    = ts(tier);
 
-  // Streak (per tier)
   if (state.history.length > 0) {
     const dir = bestUsd >= state.history[0].usd ? 'up' : 'down';
     state.streak    = dir === state.streakDir ? state.streak + 1 : 1;
@@ -264,37 +255,38 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
   state.history.unshift({ usd: bestUsd, ts: blockTs * 1000, hash: txHash, claimer: from });
   if (state.history.length > 200) state.history.pop();
 
-  const posInCycle = ((state.count - 1) % CYCLE_SIZE) + 1;
-  const remaining  = CYCLE_SIZE - posInCycle;
-  const cycleAvg   = state.history.slice(0, posInCycle).reduce((s, c) => s + c.usd, 0) / posInCycle;
-
-  const avgLine = [5, 10, 15, 20, 50, 100]
-    .map(n => { const v = calcAvg(state.history, n); return v !== null ? `Avg${n} $${v.toFixed(2)}` : null; })
-    .filter(Boolean).join(' | ');
-
-  const sEmoji = state.streakDir === 'down' ? '🔴' : '🟢';
   const date   = new Date(blockTs * 1000).toISOString().replace('T', ' ').slice(0, 19) + 'Z';
   const txUrl  = `https://basescan.org/tx/${txHash}`;
 
-  const msg = [
-    `${tierInfo.emoji} Total Value: $${bestUsd.toFixed(2)} [${tierInfo.name}]`,
-    `📍 Döngü: ${posInCycle}/${CYCLE_SIZE} (~${remaining} kaldı) — Döngü Avg: $${cycleAvg.toFixed(2)}`,
-    `${sEmoji} Streak: ${state.streak}`,
-    avgLine ? `📊 ${avgLine}` : null,
-    `👤 ${from}`,
-    `🕐 ${date} | <a href="${txUrl}">TX</a>`,
-  ].filter(Boolean).join('\n');
+  if (TIER_INFO[tier]) {
+    // ── Tam bildirim: opal ($1) ve jade ($5) ──────────────────────────────────
+    const posInCycle = ((state.count - 1) % CYCLE_SIZE) + 1;
+    const remaining  = CYCLE_SIZE - posInCycle;
+    const cycleAvg   = state.history.slice(0, posInCycle).reduce((s, c) => s + c.usd, 0) / posInCycle;
+    const avgLine    = [5, 10, 15, 20, 50, 100]
+      .map(n => { const v = calcAvg(state.history, n); return v !== null ? `Avg${n} $${v.toFixed(2)}` : null; })
+      .filter(Boolean).join(' | ');
+    const sEmoji = state.streakDir === 'down' ? '🔴' : '🟢';
 
-  console.log(`[✓] tier${tier}(${tierInfo.name}) $${bestUsd.toFixed(2)} cycle=${posInCycle}/${CYCLE_SIZE} streak=${state.streak} | ${txHash.slice(0,10)}`);
+    const msg = [
+      `${tierInfo.emoji} Total Value: $${bestUsd.toFixed(2)} [${tierInfo.name}]`,
+      `📍 Döngü: ${posInCycle}/${CYCLE_SIZE} (~${remaining} kaldı) — Döngü Avg: $${cycleAvg.toFixed(2)}`,
+      `${sEmoji} Streak: ${state.streak}`,
+      avgLine ? `📊 ${avgLine}` : null,
+      `👤 ${from}`,
+      `🕐 ${date} | <a href="${txUrl}">TX</a>`,
+    ].filter(Boolean).join('\n');
 
-  if (CHANNEL_ID) {
-    try {
-      await bot.sendMessage(CHANNEL_ID, msg, { parse_mode: 'HTML', disable_web_page_preview: true });
-    } catch (e) { console.error('[TG]', e.message); }
+    console.log(`[✓] ${tierInfo.name} $${bestUsd.toFixed(2)} cycle=${((state.count-1)%CYCLE_SIZE)+1}/${CYCLE_SIZE} streak=${state.streak} | ${txHash.slice(0,10)}`);
+    await sendNotification(msg);
+  } else {
+    // ── Kısa spam bildirimi: diğer tüm tierlar ─────────────────────────────────────
+    const msg = `${tierInfo.emoji} $${bestUsd.toFixed(2)} [${tierInfo.name}] 👤 ${from} 🕐 ${date} | <a href="${txUrl}">TX</a>`;
+    console.log(`[spam] tier${tier} $${bestUsd.toFixed(2)} | ${txHash.slice(0,10)}`);
+    await sendNotification(msg);
   }
 }
 
-// ─ Block scanner ──────────────────────────────────────────────────────────────────────
 async function scanBlocks(fromBlock, toBlock) {
   const found = [];
   const BATCH = 8;
@@ -379,21 +371,16 @@ async function pollLoop() {
   }
 }
 
-// ─ Telegram messages ─────────────────────────────────────────────────────────────────
 function buildTierMsg(tierNum) {
   const state    = ts(tierNum);
   const tierInfo = getTierInfo(tierNum);
-  if (!state.count)
-    return `${tierInfo.emoji} Henüz ${tierInfo.name} kaydı yok.`;
-
+  if (!state.count) return `${tierInfo.emoji} Henüz ${tierInfo.name} kaydı yok.`;
   const posInCycle = ((state.count - 1) % CYCLE_SIZE) + 1;
   const cycleAvg   = state.history.slice(0, posInCycle).reduce((s, c) => s + c.usd, 0) / posInCycle;
   const sEmoji     = state.streakDir === 'down' ? '🔴' : '🟢';
-
-  const avgLines = [5, 10, 15, 20, 50, 100]
+  const avgLines   = [5, 10, 15, 20, 50, 100]
     .map(n => { const v = calcAvg(state.history, n); return v !== null ? `Avg${n}: $${v.toFixed(2)}` : null; })
     .filter(Boolean).join('\n');
-
   return [
     `${tierInfo.emoji} <b>${tierInfo.name.toUpperCase()} İstatistikleri</b> ${VERSION}`,
     '',
@@ -405,24 +392,16 @@ function buildTierMsg(tierNum) {
   ].join('\n');
 }
 
-// ─ Interactive /start flow ─────────────────────────────────────────────────────────
-const TIERS_ORDER = [1, 2]; // opal then jade
+const TIERS_ORDER = [1, 2];
 
 async function startConversation(chatId) {
-  // Overview message
-  const lines = [
-    `👋 <b>Scratch Card Tracker</b> ${VERSION}`,
-    '',
-    '📊 Döngü Sayıcıları:',
-  ];
+  const lines = [`👋 <b>Scratch Card Tracker</b> ${VERSION}`, '', '📊 Döngü Sayıcıları:'];
   for (const t of TIERS_ORDER) {
     const info = getTierInfo(t);
     lines.push(`  • ${info.emoji} ${info.name}: Kaç paket açıldı? (?/${info.target})`);
   }
   lines.push('', '💬 Sırayla cevapla');
   await bot.sendMessage(chatId, lines.join('\n'), { parse_mode: 'HTML' });
-
-  // Start the first question
   conversations[chatId] = { step: 0, data: {} };
   const first = getTierInfo(TIERS_ORDER[0]);
   await bot.sendMessage(chatId, `${first.emoji} ${first.name} ($${first.nominalUsd}): Kaç paket açıldı? (?/${first.target})`);
@@ -431,67 +410,44 @@ async function startConversation(chatId) {
 async function handleConversationReply(chatId, text) {
   const conv = conversations[chatId];
   if (!conv) return;
-
   const n = parseInt(text.trim(), 10);
   if (isNaN(n) || n < 0 || n > 50000) {
     await bot.sendMessage(chatId, '❌ Geçerli bir sayı girin (örn: 45)');
     return;
   }
-
   const tierNum = TIERS_ORDER[conv.step];
   conv.data[tierNum] = n;
   conv.step++;
-
   if (conv.step < TIERS_ORDER.length) {
-    // Ask next tier
     const next = getTierInfo(TIERS_ORDER[conv.step]);
     await bot.sendMessage(chatId, `${next.emoji} ${next.name} ($${next.nominalUsd}): Kaç paket açıldı? (?/${next.target})`);
   } else {
-    // All tiers answered — apply and confirm
     delete conversations[chatId];
-
-    for (const t of TIERS_ORDER) {
-      if (conv.data[t] !== undefined)
-        ts(t).sessionCount = conv.data[t];
-    }
-
-    const summaryLines = ['✅ Döngü Sayıcıları Ayarlandı:'];
+    for (const t of TIERS_ORDER)
+      if (conv.data[t] !== undefined) ts(t).sessionCount = conv.data[t];
+    const lines = ['✅ Döngü Sayıcıları Ayarlandı:'];
     for (const t of TIERS_ORDER) {
       const info = getTierInfo(t);
       const avg  = overallAvg(t);
-      const cnt  = ts(t).sessionCount;
-      summaryLines.push(
-        `  • ${info.emoji} ${info.name}: ${cnt}/${info.target} (ort: ${avg !== null ? '$'+avg.toFixed(2) : 'N/A'})`
-      );
+      lines.push(`  • ${info.emoji} ${info.name}: ${ts(t).sessionCount}/${info.target} (ort: ${avg !== null ? '$'+avg.toFixed(2) : 'N/A'})`);
     }
-    summaryLines.push('', '💡 Yeni paket gelince sayıç otomatik ilerleyecek.');
-    await bot.sendMessage(chatId, summaryLines.join('\n'), { parse_mode: 'HTML' });
+    lines.push('', '💡 Yeni paket gelince sayıç otomatik ilerleyecek.');
+    await bot.sendMessage(chatId, lines.join('\n'), { parse_mode: 'HTML' });
   }
 }
 
-// ─ Main ───────────────────────────────────────────────────────────────────────────
 async function main() {
   provider = await getProvider();
   bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
-  // Commands
   bot.onText(/\/start/, (msg) => startConversation(msg.chat.id).catch(console.error));
+  bot.onText(/\/sc1/,   (msg) => bot.sendMessage(msg.chat.id, buildTierMsg(1), { parse_mode: 'HTML' }).catch(console.error));
+  bot.onText(/\/sc5/,   (msg) => bot.sendMessage(msg.chat.id, buildTierMsg(2), { parse_mode: 'HTML' }).catch(console.error));
 
-  bot.onText(/\/sc1/, (msg) => {
-    bot.sendMessage(msg.chat.id, buildTierMsg(1), { parse_mode: 'HTML' })
-      .catch(e => bot.sendMessage(msg.chat.id, `Hata: ${e.message}`));
-  });
-
-  bot.onText(/\/sc5/, (msg) => {
-    bot.sendMessage(msg.chat.id, buildTierMsg(2), { parse_mode: 'HTML' })
-      .catch(e => bot.sendMessage(msg.chat.id, `Hata: ${e.message}`));
-  });
-
-  // Conversation replies (non-command messages)
   bot.on('message', (msg) => {
     const text = (msg.text || '').trim();
-    if (text.startsWith('/')) return; // handled by onText above
-    if (!conversations[msg.chat.id]) return; // no active conversation
+    if (text.startsWith('/')) return;
+    if (!conversations[msg.chat.id]) return;
     handleConversationReply(msg.chat.id, text).catch(console.error);
   });
 
@@ -500,7 +456,7 @@ async function main() {
       pollingErrCount++;
       if (pollingErrCount === 1)
         console.error('[TG] 409 Conflict — başka bir instance aktif! Eski Railway/Northflank instance\'ını durdur.');
-      if (pollingErrCount > 80) { console.error('[TG] 80+ 409, yeniden başlatılıyor'); process.exit(1); }
+      if (pollingErrCount > 80) { console.error('[TG] 80+ 409, çıkılıyor'); process.exit(1); }
     } else {
       pollingErrCount = 0;
       console.error('[TG polling]', e.message);
