@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v8';
+const VERSION = 'v9';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -25,58 +25,60 @@ const RPCS = [
   'https://base.blockscout.com/api/eth-rpc',
 ].filter(Boolean);
 
-// Tier config: name + emoji. Tier decoded from calldata field #1 (uint8).
+// Tier config — tier decoded from calldata field #1 (uint8)
 const TIER_INFO = {
-  1: { name: 'opal', emoji: '💎', nominalUsd: 1 },
-  2: { name: 'jade', emoji: '🎱', nominalUsd: 5 },
+  1: { name: 'opal', emoji: '\u{1F48E}', nominalUsd: 1,  target: SC1_TARGET },
+  2: { name: 'jade', emoji: '\u{1F3B1}', nominalUsd: 5,  target: SC5_TARGET },
 };
 function getTierInfo(t) {
-  return TIER_INFO[t] || { name: `tier${t}`, emoji: '📦', nominalUsd: t };
+  return TIER_INFO[t] || { name: `tier${t}`, emoji: '\u{1F4E6}', nominalUsd: t, target: 100 };
 }
 
 const CLAIM_SELECTORS = new Set([
-  '0x4e71d92d', // claim()
-  '0x379607f5', // claim(uint256)
-  '0x1e83409a', // claim(address)
-  '0x48c54b9d', // claimTokens()
-  '0x2e7ba6ef', // redeem(uint256)
-  '0xbd66528a', // scratch()
-  '0xdb006a75', // redeem()
-  '0x96c55175', // claim(uint256,address)
-  '0xae169a50', // claimReward(uint256)
+  '0x4e71d92d', '0x379607f5', '0x1e83409a',
+  '0x48c54b9d', '0x2e7ba6ef', '0xbd66528a',
+  '0xdb006a75', '0x96c55175', '0xae169a50',
 ]);
 
 // claim(uint64 batchId, uint8 tier, uint256 seed, uint256 nonce, uint256 deadline)
-// calldata = 0x(8) + batchId(64) + tier(64) + seed(64) + nonce(64) + deadline(64) = 330 chars
+// 0x(2) + selector(8) + batchId(64) + tier(64) + seed(64) + nonce(64) + deadline(64) = 330
 function isClaimInput(data) {
   if (!data || data.length < 10) return false;
   if (CLAIM_SELECTORS.has(data.slice(0, 10).toLowerCase())) return true;
-  if (data.length === 330) return true; // 5-param variant
+  if (data.length === 330) return true;
   return false;
 }
 
 function decodeTier(data) {
   if (!data || data.length !== 330) return null;
-  // tier is 2nd ABI param: offset 10 (selector) + 64 (batchId) = 74
-  const t = parseInt(data.slice(74, 138), 16);
+  const t = parseInt(data.slice(74, 138), 16); // offset: 10(sel)+64(batchId)=74
   return (t >= 1 && t <= 20) ? t : null;
 }
 
-const TRANSFER_TOPIC  = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+const TRANSFER_TOPIC   = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 const CHAINLINK_ETHUSD = '0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70';
 const WETH             = '0x4200000000000000000000000000000000000006';
 const USDC             = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
 const UNI_FACTORY      = '0x33128a8fC17869897dcE68Ed026d694621f6FDfD';
 const AERO_FACTORY     = '0x420DD381b31aEf6683db6B902084cB0FFECe40Da';
-const CYCLE_SIZE = 50;
+const CYCLE_SIZE       = 50;
 
-// ─ Per-tier state ─────────────────────────────────────────────────────────────────────────
+// ─ Per-tier state ───────────────────────────────────────────────────────────────────
 const tierStates = {};
 function ts(tier) {
   if (!tierStates[tier])
-    tierStates[tier] = { history: [], count: 0, streak: 0, streakDir: null };
+    tierStates[tier] = {
+      history: [],
+      count: 0,        // total blockchain claims processed
+      sessionCount: 0, // user-set + auto-incremented; shown in /start
+      streak: 0,
+      streakDir: null,
+    };
   return tierStates[tier];
 }
+
+// Conversation state for /start interactive flow
+const conversations = {}; // chatId -> { step, data }
 
 let processedTxs = new Set();
 let pollingErrCount = 0;
@@ -86,7 +88,7 @@ let priceCache = {};
 let ethPrice = 0, ethPriceAt = 0;
 let lastPollBlock = 0;
 
-// ─ RPC ──────────────────────────────────────────────────────────────────────────────
+// ─ RPC / price helpers (unchanged) ──────────────────────────────────────────────
 async function getProvider() {
   for (const rpc of RPCS) {
     try {
@@ -152,13 +154,12 @@ async function getTokenPriceUsd(address) {
         const [s, t0] = await Promise.all([pool.slot0(), pool.token0()]);
         const isT0 = t0.toLowerCase() === k;
         const sq = Number(s[0]) / 2 ** 96, pr = sq * sq;
-        const piq = isT0 ? pr * (10**qDec) / (10**decimals) : (1/pr) * (10**decimals) / (10**qDec);
+        const piq = isT0 ? pr*(10**qDec)/(10**decimals) : (1/pr)*(10**decimals)/(10**qDec);
         const pusd = isEth ? piq * await getEthUsd() : piq;
         if (pusd > 0 && pusd < 1e12) { priceCache[k] = { price: pusd, at: Date.now() }; return pusd; }
       } catch (_) {}
     }
   }
-
   try {
     const af = new ethers.Contract(AERO_FACTORY,
       ['function getPair(address,address,bool) view returns (address)'], provider);
@@ -176,13 +177,12 @@ async function getTokenPriceUsd(address) {
           const tokR = Number(ethers.formatUnits(isT0 ? res[0] : res[1], decimals));
           const quoR = Number(ethers.formatUnits(isT0 ? res[1] : res[0], qDec));
           if (tokR <= 0 || quoR <= 0) continue;
-          const pusd = isEth ? (quoR/tokR) * await getEthUsd() : quoR/tokR;
+          const pusd = isEth ? (quoR/tokR)*await getEthUsd() : quoR/tokR;
           if (pusd > 0 && pusd < 1e12) { priceCache[k] = { price: pusd, at: Date.now() }; return pusd; }
         } catch (_) {}
       }
     }
   } catch (_) {}
-
   try {
     const r = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${address}`, { timeout: 8000 });
     const pairs = (r.data?.pairs || []).filter(p => p.chainId === 'base');
@@ -191,16 +191,22 @@ async function getTokenPriceUsd(address) {
       if (price > 0) { priceCache[k] = { price, at: Date.now() }; return price; }
     }
   } catch (_) {}
-
   return null;
 }
 
-// ─ Core: process one claim TX ─────────────────────────────────────────────────────────
+// ─ Core helpers ──────────────────────────────────────────────────────────────────────
 function calcAvg(arr, n) {
   if (arr.length < n) return null;
   return arr.slice(0, n).reduce((s, v) => s + v.usd, 0) / n;
 }
 
+function overallAvg(tierNum) {
+  const h = (tierStates[tierNum] || {}).history || [];
+  if (!h.length) return null;
+  return h.reduce((s, c) => s + c.usd, 0) / h.length;
+}
+
+// ─ Process one claim TX ────────────────────────────────────────────────────────────
 async function processClaimTx(txHash, from, data, blockNum, blockTs) {
   if (processedTxs.has(txHash)) return;
   processedTxs.add(txHash);
@@ -213,8 +219,6 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
   if (!receipt || receipt.status === 0) return;
 
   const claimer = from.toLowerCase();
-
-  // Collect ERC20 transfers TO claimer
   const received = {};
   for (const log of receipt.logs) {
     if (log.topics[0]?.toLowerCase() !== TRANSFER_TOPIC) continue;
@@ -226,11 +230,8 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
     received[tokenAddr] = (received[tokenAddr] ?? 0n) + amount;
   }
 
-  if (!Object.keys(received).length) {
-    console.log(`[SKIP ${txHash.slice(0,10)}] transfer yok`); return;
-  }
+  if (!Object.keys(received).length) return;
 
-  // Pick highest-USD token
   let bestUsd = 0, bestToken = null;
   for (const [addr, rawAmt] of Object.entries(received)) {
     try {
@@ -243,16 +244,13 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
     } catch (_) {}
   }
 
-  if (!bestToken || bestUsd <= 0) {
-    console.log(`[SKIP ${txHash.slice(0,10)}] fiyat yok`); return;
-  }
+  if (!bestToken || bestUsd <= 0) return;
 
-  // Tier from calldata; fallback to nominal threshold
   const tier     = decodeTier(data) ?? (bestUsd >= 2.5 ? 2 : 1);
   const tierInfo = getTierInfo(tier);
   const state    = ts(tier);
 
-  // Streak (per tier, red = down, green = up)
+  // Streak (per tier)
   if (state.history.length > 0) {
     const dir = bestUsd >= state.history[0].usd ? 'up' : 'down';
     state.streak    = dir === state.streakDir ? state.streak + 1 : 1;
@@ -262,6 +260,7 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
   }
 
   state.count++;
+  state.sessionCount++;
   state.history.unshift({ usd: bestUsd, ts: blockTs * 1000, hash: txHash, claimer: from });
   if (state.history.length > 200) state.history.pop();
 
@@ -323,7 +322,6 @@ async function scanBlocks(fromBlock, toBlock) {
   return found;
 }
 
-// ─ Blockscout history loader ────────────────────────────────────────────────────────
 async function loadHistory() {
   console.log('[HISTORY] Blockscout API...');
   try {
@@ -333,7 +331,6 @@ async function loadHistory() {
     );
     const items = r.data?.items || [];
     console.log(`[HISTORY] ${items.length} TX`);
-
     const claimTxs = items
       .filter(tx => {
         if (tx.status !== 'ok') return false;
@@ -343,7 +340,6 @@ async function loadHistory() {
         return CLAIM_SELECTORS.has(raw.slice(0, 10).toLowerCase()) || raw.length === 330;
       })
       .sort((a, b) => a.block - b.block);
-
     console.log(`[HISTORY] ${claimTxs.length} claim TX`);
     for (const tx of claimTxs) {
       try {
@@ -356,7 +352,6 @@ async function loadHistory() {
   } catch (e) { console.error('[HISTORY]', e.message); }
 }
 
-// ─ Poll loop ───────────────────────────────────────────────────────────────────────
 async function pollLoop() {
   let fails = 0;
   console.log('[POLL] Canlı izleme başlıyor...');
@@ -368,10 +363,9 @@ async function pollLoop() {
         const from = lastPollBlock + 1;
         const to   = Math.min(cur, lastPollBlock + 20);
         const txs  = await scanBlocks(from, to);
-        for (const tx of txs) {
+        for (const tx of txs)
           if (!processedTxs.has(tx.hash))
             await processClaimTx(tx.hash, tx.from, tx.data, tx.blockNum, tx.blockTs);
-        }
         lastPollBlock = to;
       }
       fails = 0;
@@ -385,32 +379,10 @@ async function pollLoop() {
   }
 }
 
-// ─ Telegram messages ──────────────────────────────────────────────────────────────────
-function overallAvg(tierNum) {
-  const h = (tierStates[tierNum] || {}).history || [];
-  if (!h.length) return null;
-  return h.reduce((s, c) => s + c.usd, 0) / h.length;
-}
-
-function buildStartMsg() {
-  const s1 = ts(1), s2 = ts(2);
-  const avg1 = overallAvg(1), avg5 = overallAvg(2);
-  return [
-    `📊 <b>Scratch Card Tracker</b> ${VERSION}`,
-    '',
-    `💎 1 dolarlık paketlerden kaçı açıldı?`,
-    `→ ${s1.count}/${SC1_TARGET}${avg1 !== null ? `  (Ort: $${avg1.toFixed(2)})` : ''}`,
-    '',
-    `🎱 5 dolarlık paketlerden kaçı açıldı?`,
-    `→ ${s2.count}/${SC5_TARGET}${avg5 !== null ? `  (Ort: $${avg5.toFixed(2)})` : ''}`,
-  ].join('\n');
-}
-
+// ─ Telegram messages ─────────────────────────────────────────────────────────────────
 function buildTierMsg(tierNum) {
   const state    = ts(tierNum);
   const tierInfo = getTierInfo(tierNum);
-  const target   = tierNum === 1 ? SC1_TARGET : SC5_TARGET;
-
   if (!state.count)
     return `${tierInfo.emoji} Henüz ${tierInfo.name} kaydı yok.`;
 
@@ -425,7 +397,7 @@ function buildTierMsg(tierNum) {
   return [
     `${tierInfo.emoji} <b>${tierInfo.name.toUpperCase()} İstatistikleri</b> ${VERSION}`,
     '',
-    `Toplam: ${state.count}/${target}`,
+    `Toplam: ${state.sessionCount}/${tierInfo.target}`,
     `📍 Döngü: ${posInCycle}/${CYCLE_SIZE} — Avg: $${cycleAvg.toFixed(2)}`,
     `${sEmoji} Streak: ${state.streak}`,
     '',
@@ -433,15 +405,77 @@ function buildTierMsg(tierNum) {
   ].join('\n');
 }
 
+// ─ Interactive /start flow ─────────────────────────────────────────────────────────
+const TIERS_ORDER = [1, 2]; // opal then jade
+
+async function startConversation(chatId) {
+  // Overview message
+  const lines = [
+    `👋 <b>Scratch Card Tracker</b> ${VERSION}`,
+    '',
+    '📊 Döngü Sayıcıları:',
+  ];
+  for (const t of TIERS_ORDER) {
+    const info = getTierInfo(t);
+    lines.push(`  • ${info.emoji} ${info.name}: Kaç paket açıldı? (?/${info.target})`);
+  }
+  lines.push('', '💬 Sırayla cevapla');
+  await bot.sendMessage(chatId, lines.join('\n'), { parse_mode: 'HTML' });
+
+  // Start the first question
+  conversations[chatId] = { step: 0, data: {} };
+  const first = getTierInfo(TIERS_ORDER[0]);
+  await bot.sendMessage(chatId, `${first.emoji} ${first.name} ($${first.nominalUsd}): Kaç paket açıldı? (?/${first.target})`);
+}
+
+async function handleConversationReply(chatId, text) {
+  const conv = conversations[chatId];
+  if (!conv) return;
+
+  const n = parseInt(text.trim(), 10);
+  if (isNaN(n) || n < 0 || n > 50000) {
+    await bot.sendMessage(chatId, '❌ Geçerli bir sayı girin (örn: 45)');
+    return;
+  }
+
+  const tierNum = TIERS_ORDER[conv.step];
+  conv.data[tierNum] = n;
+  conv.step++;
+
+  if (conv.step < TIERS_ORDER.length) {
+    // Ask next tier
+    const next = getTierInfo(TIERS_ORDER[conv.step]);
+    await bot.sendMessage(chatId, `${next.emoji} ${next.name} ($${next.nominalUsd}): Kaç paket açıldı? (?/${next.target})`);
+  } else {
+    // All tiers answered — apply and confirm
+    delete conversations[chatId];
+
+    for (const t of TIERS_ORDER) {
+      if (conv.data[t] !== undefined)
+        ts(t).sessionCount = conv.data[t];
+    }
+
+    const summaryLines = ['✅ Döngü Sayıcıları Ayarlandı:'];
+    for (const t of TIERS_ORDER) {
+      const info = getTierInfo(t);
+      const avg  = overallAvg(t);
+      const cnt  = ts(t).sessionCount;
+      summaryLines.push(
+        `  • ${info.emoji} ${info.name}: ${cnt}/${info.target} (ort: ${avg !== null ? '$'+avg.toFixed(2) : 'N/A'})`
+      );
+    }
+    summaryLines.push('', '💡 Yeni paket gelince sayıç otomatik ilerleyecek.');
+    await bot.sendMessage(chatId, summaryLines.join('\n'), { parse_mode: 'HTML' });
+  }
+}
+
 // ─ Main ───────────────────────────────────────────────────────────────────────────
 async function main() {
   provider = await getProvider();
   bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
-  bot.onText(/\/start/, (msg) => {
-    bot.sendMessage(msg.chat.id, buildStartMsg(), { parse_mode: 'HTML' })
-      .catch(e => bot.sendMessage(msg.chat.id, `Hata: ${e.message}`));
-  });
+  // Commands
+  bot.onText(/\/start/, (msg) => startConversation(msg.chat.id).catch(console.error));
 
   bot.onText(/\/sc1/, (msg) => {
     bot.sendMessage(msg.chat.id, buildTierMsg(1), { parse_mode: 'HTML' })
@@ -453,12 +487,20 @@ async function main() {
       .catch(e => bot.sendMessage(msg.chat.id, `Hata: ${e.message}`));
   });
 
+  // Conversation replies (non-command messages)
+  bot.on('message', (msg) => {
+    const text = (msg.text || '').trim();
+    if (text.startsWith('/')) return; // handled by onText above
+    if (!conversations[msg.chat.id]) return; // no active conversation
+    handleConversationReply(msg.chat.id, text).catch(console.error);
+  });
+
   bot.on('polling_error', (e) => {
     if (e.message?.includes('409')) {
       pollingErrCount++;
       if (pollingErrCount === 1)
-        console.error('[TG] 409 Conflict — başka bir bot instance aktif! Eski Railway/Northflank instance\'ını durdur.');
-      if (pollingErrCount > 80) { console.error('[TG] 80+ ardalan 409, yeniden başlatılıyor'); process.exit(1); }
+        console.error('[TG] 409 Conflict — başka bir instance aktif! Eski Railway/Northflank instance\'ını durdur.');
+      if (pollingErrCount > 80) { console.error('[TG] 80+ 409, yeniden başlatılıyor'); process.exit(1); }
     } else {
       pollingErrCount = 0;
       console.error('[TG polling]', e.message);
