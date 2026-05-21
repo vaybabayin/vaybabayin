@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v9.11';
+const VERSION = 'v9.12';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -46,6 +46,7 @@ const WETH_LOWER       = WETH.toLowerCase();
 const tierStates = {};
 function ts(tier) {
   if (!tierStates[tier])
+    // sessionCount = user-provided starting offset + claims seen since then
     tierStates[tier] = { history: [], count: 0, sessionCount: 0, streak: 0, streakDir: null };
   return tierStates[tier];
 }
@@ -189,7 +190,6 @@ async function sendNotification(msg) {
   }
 }
 
-// Find NFT mint emitted by the scratch card contract (ERC721 Transfer with 4 topics, from=0x0)
 function findNftMint(receipt) {
   for (const log of receipt.logs) {
     if (log.topics[0]?.toLowerCase() !== TRANSFER_TOPIC) continue;
@@ -204,7 +204,6 @@ function findNftMint(receipt) {
   return null;
 }
 
-// Find NFT burn (Transfer to 0x0) emitted by the scratch card contract
 function findNftBurn(receipt) {
   for (const log of receipt.logs) {
     if (log.topics[0]?.toLowerCase() !== TRANSFER_TOPIC) continue;
@@ -219,7 +218,6 @@ function findNftBurn(receipt) {
   return null;
 }
 
-// USDC paid from `payer` to contract in this receipt
 function findUsdcPayment(receipt, payer) {
   for (const log of receipt.logs) {
     if (log.topics[0]?.toLowerCase() !== TRANSFER_TOPIC) continue;
@@ -239,14 +237,12 @@ function classifyByUsdc(usdAmount) {
   return null;
 }
 
-// Try to read NFT id from calldata: claim(uint256 nftId) shape
 function nftIdFromCalldata(data) {
   if (!data || data.length < 74) return null;
   try { return BigInt('0x' + data.slice(10, 74)).toString(); }
   catch (_) { return null; }
 }
 
-// Reward tokens sent to recipient. First pass: from contract or mint. Fallback: any except WETH.
 function collectReceived(receipt, recipient) {
   const received = {};
   for (const log of receipt.logs) {
@@ -325,7 +321,7 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
     return;
   }
 
-  // 2) CLAIM TX: figure out which NFT was claimed
+  // 2) CLAIM TX
   let claimedNftId = null;
   const burn = findNftBurn(receipt);
   if (burn) claimedNftId = burn.nftId;
@@ -348,13 +344,11 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
     return;
   }
 
-  // Fallback: if no NFT mapping but reward USD strongly suggests a tier, classify it
   if (tier === null) {
     if (totalUsd >= 0.05 && totalUsd < 2.5) tier = 1;
     else if (totalUsd >= 2.5 && totalUsd < 10) tier = 2;
-    if (tier !== null) {
+    if (tier !== null)
       console.log(`[FALLBACK tier=${tier}] nft=${claimedNftId} — mapping yok, USD'den ($${totalUsd.toFixed(2)}) tahmin | ${txHash.slice(0,10)}`);
-    }
   }
 
   if (tier === null) {
@@ -381,9 +375,11 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
 
   const date       = new Date(blockTs * 1000).toISOString().replace('T', ' ').slice(0, 19) + 'Z';
   const txUrl      = `https://basescan.org/tx/${txHash}`;
-  const posInCycle = ((state.count - 1) % cycleSize) + 1;
+  // sessionCount = user-provided offset + claims seen since — use this for accurate cycle position
+  const posInCycle = ((state.sessionCount - 1) % cycleSize) + 1;
   const remaining  = cycleSize - posInCycle;
-  const cycleAvg   = state.history.slice(0, posInCycle).reduce((s, c) => s + c.usd, 0) / posInCycle;
+  const cycleSlice = state.history.slice(0, posInCycle);
+  const cycleAvg   = cycleSlice.reduce((s, c) => s + c.usd, 0) / (cycleSlice.length || 1);
   const avgLine    = [5, 10, 15, 20, 50, 100]
     .map(n => { const v = calcAvg(state.history, n); return v !== null ? `Avg${n} $${v.toFixed(2)}` : null; })
     .filter(Boolean).join(' | ');
@@ -468,7 +464,6 @@ async function scanBlocks(fromBlock, toBlock) {
       if (!block) continue;
       for (const tx of (block.prefetchedTransactions || [])) {
         if (tx.to?.toLowerCase() !== CONTRACT_LOWER) continue;
-        // Process every TX to the contract (mint or claim).
         found.push({
           hash: tx.hash, from: tx.from,
           data: tx.data || tx.input,
@@ -492,7 +487,7 @@ async function loadHistory() {
     console.log(`[HISTORY] ${items.length} TX`);
     const txs = items
       .filter(tx => tx.status === 'ok')
-      .sort((a, b) => a.block - b.block); // oldest first — buys before claims
+      .sort((a, b) => a.block - b.block); // oldest first - buys before claims
     for (const tx of txs) {
       try {
         const blockTs  = Math.floor(new Date(tx.timestamp).getTime() / 1000);
@@ -535,9 +530,10 @@ function buildTierMsg(tierNum) {
   const state     = ts(tierNum);
   const tierInfo  = TIER_INFO[tierNum];
   const cycleSize = tierInfo.target;
-  if (!state.count) return `${tierInfo.emoji} Henüz ${tierInfo.name} kaydı yok.`;
-  const posInCycle = ((state.count - 1) % cycleSize) + 1;
-  const cycleAvg   = state.history.slice(0, posInCycle).reduce((s, c) => s + c.usd, 0) / posInCycle;
+  if (!state.sessionCount) return `${tierInfo.emoji} Henüz ${tierInfo.name} kaydı yok.`;
+  const posInCycle = ((state.sessionCount - 1) % cycleSize) + 1;
+  const cycleSlice = state.history.slice(0, posInCycle);
+  const cycleAvg   = cycleSlice.reduce((s, c) => s + c.usd, 0) / (cycleSlice.length || 1);
   const sEmoji     = state.streakDir === 'down' ? '🔴' : '🟢';
   const avgLines   = [5, 10, 15, 20, 50, 100]
     .map(n => { const v = calcAvg(state.history, n); return v !== null ? `Avg${n}: $${v.toFixed(2)}` : null; })
@@ -625,7 +621,7 @@ async function main() {
     registeredChats.add(String(chatId));
     try {
       await bot.sendMessage(chatId,
-        `✅ <b>Test mesajı</b> ${VERSION}\n📡 Bot çalışıyor!\n📋 Kayıtlı chat: ${registeredChats.size}\n📇 NFT map: ${nftToTier.size}\n🟢 green (${SC1_TARGET}): ${ts(1).count} | 🟣 purple (${SC5_TARGET}): ${ts(2).count}`,
+        `✅ <b>Test mesajı</b> ${VERSION}\n📡 Bot çalışıyor!\n📋 Kayıtlı chat: ${registeredChats.size}\n📇 NFT map: ${nftToTier.size}\n🟢 green (${SC1_TARGET}): ${ts(1).sessionCount} | 🟣 purple (${SC5_TARGET}): ${ts(2).sessionCount}`,
         { parse_mode: 'HTML' }
       );
     } catch (e) { console.error('[TEST]', e.message); }
@@ -664,7 +660,7 @@ async function main() {
   console.log(`[${VERSION}] Contract: ${CONTRACT}`);
   console.log(`[${VERSION}] green=$1 döngü=${SC1_TARGET} | purple=$5 döngü=${SC5_TARGET}`);
   await loadHistory();
-  console.log(`[HISTORY] NFT map=${nftToTier.size} | green=${ts(1).count}/${SC1_TARGET}  purple=${ts(2).count}/${SC5_TARGET}`);
+  console.log(`[HISTORY] NFT map=${nftToTier.size} | green=${ts(1).sessionCount}/${SC1_TARGET}  purple=${ts(2).sessionCount}/${SC5_TARGET}`);
   lastPollBlock = 0;
   await pollLoop();
 }
