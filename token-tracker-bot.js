@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v9.9';
+const VERSION = 'v9.10';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -14,6 +14,7 @@ if (!TELEGRAM_TOKEN) { console.error('TELEGRAM_BOT_TOKEN eksik!'); process.exit(
 
 const CONTRACT_LOWER = CONTRACT.toLowerCase();
 const ZERO_ADDRESS   = '0x0000000000000000000000000000000000000000';
+const USDC_LOWER     = '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913';
 
 const registeredChats = new Set();
 if (CHANNEL_ID) registeredChats.add(String(CHANNEL_ID));
@@ -28,18 +29,20 @@ const RPCS = [
   'https://base.blockscout.com/api/eth-rpc',
 ].filter(Boolean);
 
-// Tier USD ranges (calldata doesn't contain tier; classify by total value)
+// Tier = determined by USDC paid to contract, not by calldata
 const TIER_INFO = {
-  1: { name: 'opal', emoji: '\u{1F48E}', nominalUsd: 1, target: SC1_TARGET, minUsd: 0.30, maxUsd: 2.50 },
-  2: { name: 'jade', emoji: '\u{1F3B1}', nominalUsd: 5, target: SC5_TARGET, minUsd: 2.50, maxUsd: 10.0 },
+  1: { name: 'green',  emoji: '\u{1F7E2}', payUsd: 1, target: SC1_TARGET },
+  2: { name: 'purple', emoji: '\u{1F7E3}', payUsd: 5, target: SC5_TARGET },
 };
-const PER_TOKEN_MAX_USD = 100; // any single token > $100 is a price-lookup error
+const PER_TOKEN_MAX_USD = 100; // single-token outlier guard
 
-function classifyTier(totalUsd) {
-  for (const [n, info] of Object.entries(TIER_INFO))
-    if (totalUsd >= info.minUsd && totalUsd < info.maxUsd) return parseInt(n);
-  return null;
-}
+const TRANSFER_TOPIC   = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+const CHAINLINK_ETHUSD = '0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70';
+const WETH             = '0x4200000000000000000000000000000000000006';
+const USDC             = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
+const UNI_FACTORY      = '0x33128a8fC17869897dcE68Ed026d694621f6FDfD';
+const AERO_FACTORY     = '0x420DD381b31aEf6683db6B902084cB0FFECe40Da';
+const WETH_LOWER       = WETH.toLowerCase();
 
 const CLAIM_SELECTORS = new Set([
   '0x4e71d92d', '0x379607f5', '0x1e83409a',
@@ -52,13 +55,24 @@ function isClaimInput(data) {
   return CLAIM_SELECTORS.has(data.slice(0, 10).toLowerCase());
 }
 
-const TRANSFER_TOPIC   = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
-const CHAINLINK_ETHUSD = '0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70';
-const WETH             = '0x4200000000000000000000000000000000000006';
-const USDC             = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
-const UNI_FACTORY      = '0x33128a8fC17869897dcE68Ed026d694621f6FDfD';
-const AERO_FACTORY     = '0x420DD381b31aEf6683db6B902084cB0FFECe40Da';
-const WETH_LOWER       = WETH.toLowerCase();
+// Detect tier by how much USDC the claimer sent to the contract in this TX.
+// Returns 1 (green/$1), 2 (purple/$5), or null (not a known tier).
+function detectTierByPayment(receipt, claimer) {
+  for (const log of receipt.logs) {
+    if (log.topics[0]?.toLowerCase() !== TRANSFER_TOPIC) continue;
+    if (log.topics.length < 3) continue;
+    const fromLog  = ('0x' + log.topics[1].slice(26)).toLowerCase();
+    const toLog    = ('0x' + log.topics[2].slice(26)).toLowerCase();
+    const tokenAddr = log.address.toLowerCase();
+    if (fromLog !== claimer)       continue; // must be FROM the buyer
+    if (toLog   !== CONTRACT_LOWER) continue; // must be TO the contract
+    if (tokenAddr !== USDC_LOWER)  continue; // must be USDC
+    const usdPaid = Number(BigInt(log.data)) / 1e6; // USDC = 6 decimals
+    if (usdPaid >= 0.5 && usdPaid < 2.5) return 1;  // ~1 USDC
+    if (usdPaid >= 2.5 && usdPaid < 10)  return 2;  // ~5 USDC
+  }
+  return null;
+}
 
 const tierStates = {};
 function ts(tier) {
@@ -203,7 +217,7 @@ async function sendNotification(msg) {
   }
 }
 
-// Collect reward token transfers to claimer. Returns {received, usedFallback}.
+// Collect reward tokens sent to claimer. First pass: from/mint by contract. Fallback: any except WETH.
 function collectReceived(receipt, claimer) {
   const received = {};
   for (const log of receipt.logs) {
@@ -229,7 +243,7 @@ function collectReceived(receipt, claimer) {
   return { received, usedFallback: true };
 }
 
-async function valueReceived(received) {
+async function calcTotalUsd(received) {
   let totalUsd = 0;
   const tokenSummary = [];
   const droppedSummary = [];
@@ -252,7 +266,7 @@ async function valueReceived(received) {
   return { totalUsd, tokenSummary, droppedSummary };
 }
 
-async function processClaimTx(txHash, from, data, blockNum, blockTs) {
+async function processClaimTx(txHash, from, _data, blockNum, blockTs) {
   if (processedTxs.has(txHash)) return;
   processedTxs.add(txHash);
   if (processedTxs.size > 20000) {
@@ -267,25 +281,27 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
   }
 
   const claimer = from.toLowerCase();
+
+  // Determine tier from USDC paid to contract
+  const tier = detectTierByPayment(receipt, claimer);
+  if (tier === null) {
+    console.log(`[SKIP no-payment] USDC tespiti yok | ${txHash.slice(0,10)}`);
+    return;
+  }
+  const tierInfo = TIER_INFO[tier];
+  const cycleSize = tierInfo.target;
+
   const { received, usedFallback } = collectReceived(receipt, claimer);
   if (!Object.keys(received).length) {
     console.log(`[SKIP no-transfer] | ${txHash.slice(0,10)}`);
     return;
   }
 
-  const { totalUsd, tokenSummary, droppedSummary } = await valueReceived(received);
+  const { totalUsd, tokenSummary, droppedSummary } = await calcTotalUsd(received);
   if (totalUsd <= 0) {
     console.log(`[SKIP no-value] dropped=[${droppedSummary.join(' ')}] | ${txHash.slice(0,10)}`);
     return;
   }
-
-  const tier = classifyTier(totalUsd);
-  if (tier === null) {
-    console.log(`[SKIP usd-range] $${totalUsd.toFixed(2)} (tier 3+ or anomaly) tokens=[${tokenSummary.join(' ')}] | ${txHash.slice(0,10)}`);
-    return;
-  }
-  const tierInfo = TIER_INFO[tier];
-  const cycleSize = tierInfo.target;
 
   const state = ts(tier);
   if (state.history.length > 0) {
@@ -311,14 +327,14 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
     .filter(Boolean).join(' | ');
   const sEmoji = state.streakDir === 'down' ? '🔴' : '🟢';
   const msg = [
-    `${tierInfo.emoji} Total Value: $${totalUsd.toFixed(2)} [${tierInfo.name}]`,
+    `${tierInfo.emoji} Total Value: $${totalUsd.toFixed(2)} [${tierInfo.name} / $${tierInfo.payUsd} USDC]`,
     `📍 Döngü: ${posInCycle}/${cycleSize} (~${remaining} kaldı) — Döngü Avg: $${cycleAvg.toFixed(2)}`,
     `${sEmoji} Streak: ${state.streak}`,
     avgLine ? `📊 ${avgLine}` : null,
     `👤 ${from}`,
     `🕐 ${date} | <a href="${txUrl}">TX</a>`,
   ].filter(Boolean).join('\n');
-  console.log(`[✓] ${tierInfo.name} $${totalUsd.toFixed(2)} cyc=${posInCycle}/${cycleSize} fb=${usedFallback} | ${tokenSummary.join(' ')} | ${txHash.slice(0,10)}`);
+  console.log(`[✓] ${tierInfo.name} paid=$${tierInfo.payUsd} won=$${totalUsd.toFixed(2)} cyc=${posInCycle}/${cycleSize} fb=${usedFallback} | ${tokenSummary.join(' ')} | ${txHash.slice(0,10)}`);
   await sendNotification(msg);
 }
 
@@ -327,30 +343,43 @@ async function diagnoseTx(txHash) {
   try {
     const tx = await provider.getTransaction(txHash);
     if (!tx) { lines.push('❌ TX bulunamadı'); return lines.join('\n'); }
-
-    const data = tx.data || '';
-    lines.push(`📝 Calldata: ${data.length} char, selector ${data.slice(0, 10)}`);
+    lines.push(`📝 Calldata: ${(tx.data||'').length} char, sel ${(tx.data||'').slice(0,10)}`);
 
     const receipt = await provider.getTransactionReceipt(txHash);
     if (!receipt) { lines.push('❌ Receipt: null'); return lines.join('\n'); }
     lines.push(`📜 Status: ${receipt.status === 1 ? '✅' : '❌'}`);
 
     const claimer = tx.from.toLowerCase();
+    lines.push(`👤 From: ${tx.from}`);
+
+    // Payment detection
+    const tier = detectTierByPayment(receipt, claimer);
+    if (tier === null) {
+      lines.push(`⛔ USDC ödemesi kontratta tespit edilemedi (SKIP)`);
+      // Show all USDC transfers for debugging
+      for (const log of receipt.logs) {
+        if (log.topics[0]?.toLowerCase() !== TRANSFER_TOPIC) continue;
+        if (log.address.toLowerCase() !== USDC_LOWER) continue;
+        const f = ('0x' + log.topics[1].slice(26)).toLowerCase();
+        const t = ('0x' + log.topics[2].slice(26)).toLowerCase();
+        const amt = Number(BigInt(log.data)) / 1e6;
+        lines.push(`  USDC: from=${f.slice(0,12)} to=${t.slice(0,12)} amt=$${amt.toFixed(2)}`);
+      }
+    } else {
+      lines.push(`✅ Tier: ${tier} (${TIER_INFO[tier].name}, $${TIER_INFO[tier].payUsd} USDC ödendi)`);
+    }
+
     const { received, usedFallback } = collectReceived(receipt, claimer);
-    lines.push(`💸 Token transferleri: ${Object.keys(received).length} (fallback: ${usedFallback ? 'evet' : 'hayır'})`);
+    lines.push(`💸 Ödül transferleri: ${Object.keys(received).length} token (fallback: ${usedFallback?'evet':'hayır'})`);
 
-    if (!Object.keys(received).length) { lines.push('⛔ Hiç ödül transferi yok — SKIP'); return lines.join('\n'); }
+    if (Object.keys(received).length) {
+      const { totalUsd, tokenSummary, droppedSummary } = await calcTotalUsd(received);
+      for (const t of tokenSummary)   lines.push(`  ✓ ${t}`);
+      for (const d of droppedSummary) lines.push(`  ✗ ${d}`);
+      lines.push(`💰 Kazanılan toplam: $${totalUsd.toFixed(4)}`);
+    }
 
-    const { totalUsd, tokenSummary, droppedSummary } = await valueReceived(received);
-    for (const t of tokenSummary)   lines.push(`  ✓ ${t}`);
-    for (const d of droppedSummary) lines.push(`  ✗ ${d}`);
-    lines.push(`💰 Total: $${totalUsd.toFixed(4)}`);
-
-    const tier = classifyTier(totalUsd);
-    if (tier === null) lines.push(`⛔ USD aralık dışı (opal $0.30–$2.50, jade $2.50–$10) — SKIP`);
-    else lines.push(`✅ Tier: ${tier} (${TIER_INFO[tier].name})`);
-
-    if (processedTxs.has(txHash)) lines.push('⚠️ Bu TX zaten işlendi');
+    if (processedTxs.has(txHash)) lines.push(`⚠️ Bu TX zaten işlendi`);
     lines.push(`📡 Kayıtlı chat: ${registeredChats.size}`);
   } catch (e) {
     lines.push(`❌ Hata: ${e.message.slice(0, 200)}`);
@@ -455,6 +484,7 @@ function buildTierMsg(tierNum) {
     .filter(Boolean).join('\n');
   return [
     `${tierInfo.emoji} <b>${tierInfo.name.toUpperCase()} İstatistikleri</b> ${VERSION}`,
+    `($${tierInfo.payUsd} USDC paket)`,
     '',
     `Toplam: ${state.sessionCount}/${cycleSize}`,
     `📍 Döngü: ${posInCycle}/${cycleSize} — Avg: $${cycleAvg.toFixed(2)}`,
@@ -474,13 +504,13 @@ async function startConversation(chatId) {
   const lines = [`👋 <b>Scratch Card Tracker</b> ${VERSION}`, '', '✅ Bu chat bildirim listesine eklendi.', '', '📊 Döngü Sayıcıları:'];
   for (const t of TIERS_ORDER) {
     const info = TIER_INFO[t];
-    lines.push(`  • ${info.emoji} ${info.name}: Kaç paket açıldı? (?/${info.target})`);
+    lines.push(`  • ${info.emoji} ${info.name} ($${info.payUsd} USDC): Kaç paket açıldı? (?/${info.target})`);
   }
   lines.push('', '💬 Sırayla cevapla');
   await bot.sendMessage(chatId, lines.join('\n'), { parse_mode: 'HTML' });
   conversations[chatId] = { step: 0, data: {} };
   const first = TIER_INFO[TIERS_ORDER[0]];
-  await bot.sendMessage(chatId, `${first.emoji} ${first.name} ($${first.nominalUsd}): Kaç paket açıldı? (?/${first.target})`);
+  await bot.sendMessage(chatId, `${first.emoji} ${first.name} ($${first.payUsd} USDC): Kaç paket açıldı? (?/${first.target})`);
 }
 
 async function handleConversationReply(chatId, text) {
@@ -496,7 +526,7 @@ async function handleConversationReply(chatId, text) {
   conv.step++;
   if (conv.step < TIERS_ORDER.length) {
     const next = TIER_INFO[TIERS_ORDER[conv.step]];
-    await bot.sendMessage(chatId, `${next.emoji} ${next.name} ($${next.nominalUsd}): Kaç paket açıldı? (?/${next.target})`);
+    await bot.sendMessage(chatId, `${next.emoji} ${next.name} ($${next.payUsd} USDC): Kaç paket açıldı? (?/${next.target})`);
   } else {
     delete conversations[chatId];
     for (const t of TIERS_ORDER)
@@ -535,7 +565,7 @@ async function main() {
     registeredChats.add(String(chatId));
     try {
       await bot.sendMessage(chatId,
-        `✅ <b>Test mesajı</b> ${VERSION}\n📡 Bot çalışıyor!\n📋 Kayıtlı chat: ${registeredChats.size}\n💎 opal (${SC1_TARGET}): ${ts(1).count} | 🎱 jade (${SC5_TARGET}): ${ts(2).count}`,
+        `✅ <b>Test mesajı</b> ${VERSION}\n📡 Bot çalışıyor!\n📋 Kayıtlı chat: ${registeredChats.size}\n🟢 green (${SC1_TARGET}): ${ts(1).count} | 🟣 purple (${SC5_TARGET}): ${ts(2).count}`,
         { parse_mode: 'HTML' }
       );
     } catch (e) { console.error('[TEST]', e.message); }
@@ -572,9 +602,9 @@ async function main() {
   });
 
   console.log(`[${VERSION}] Contract: ${CONTRACT}`);
-  console.log(`[${VERSION}] opal $${TIER_INFO[1].minUsd}-$${TIER_INFO[1].maxUsd} döngü=${SC1_TARGET} | jade $${TIER_INFO[2].minUsd}-$${TIER_INFO[2].maxUsd} döngü=${SC5_TARGET}`);
+  console.log(`[${VERSION}] green=$1 döngü=${SC1_TARGET} | purple=$5 döngü=${SC5_TARGET}`);
   await loadHistory();
-  console.log(`[HISTORY] opal=${ts(1).count}/${SC1_TARGET}  jade=${ts(2).count}/${SC5_TARGET}`);
+  console.log(`[HISTORY] green=${ts(1).count}/${SC1_TARGET}  purple=${ts(2).count}/${SC5_TARGET}`);
   lastPollBlock = 0;
   await pollLoop();
 }
