@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v9.12';
+const VERSION = 'v9.13';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -46,12 +46,10 @@ const WETH_LOWER       = WETH.toLowerCase();
 const tierStates = {};
 function ts(tier) {
   if (!tierStates[tier])
-    // sessionCount = user-provided starting offset + claims seen since then
     tierStates[tier] = { history: [], count: 0, sessionCount: 0, streak: 0, streakDir: null };
   return tierStates[tier];
 }
 
-// nftId (string) -> { tier, buyer, buyTxHash, buyTs }
 const nftToTier = new Map();
 
 const conversations = {};
@@ -62,6 +60,7 @@ let tokenInfoCache = {};
 let priceCache = {};
 let ethPrice = 0, ethPriceAt = 0;
 let lastPollBlock = 0;
+let isLoadingHistory = false; // suppress notifications while replaying history
 
 async function getProvider() {
   for (const rpc of RPCS) {
@@ -307,7 +306,6 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
 
   const claimer = from.toLowerCase();
 
-  // 1) BUY TX: contract mints NFT to user, user paid USDC
   const mint = findNftMint(receipt);
   if (mint) {
     const usdPaid = findUsdcPayment(receipt, mint.to);
@@ -321,7 +319,6 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
     return;
   }
 
-  // 2) CLAIM TX
   let claimedNftId = null;
   const burn = findNftBurn(receipt);
   if (burn) claimedNftId = burn.nftId;
@@ -375,7 +372,6 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
 
   const date       = new Date(blockTs * 1000).toISOString().replace('T', ' ').slice(0, 19) + 'Z';
   const txUrl      = `https://basescan.org/tx/${txHash}`;
-  // sessionCount = user-provided offset + claims seen since — use this for accurate cycle position
   const posInCycle = ((state.sessionCount - 1) % cycleSize) + 1;
   const remaining  = cycleSize - posInCycle;
   const cycleSlice = state.history.slice(0, posInCycle);
@@ -392,8 +388,13 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
     `👤 ${from}`,
     `🕐 ${date} | <a href="${txUrl}">TX</a>`,
   ].filter(Boolean).join('\n');
-  console.log(`[✓] ${tierInfo.name} won=$${totalUsd.toFixed(2)} nft=${claimedNftId} cyc=${posInCycle}/${cycleSize} fb=${usedFallback} | ${tokenSummary.join(' ')} | ${txHash.slice(0,10)}`);
-  await sendNotification(msg);
+
+  if (isLoadingHistory) {
+    console.log(`[HIST silent] ${tierInfo.name} won=$${totalUsd.toFixed(2)} nft=${claimedNftId} cyc=${posInCycle}/${cycleSize} | ${tokenSummary.join(' ')} | ${txHash.slice(0,10)}`);
+  } else {
+    console.log(`[✓] ${tierInfo.name} won=$${totalUsd.toFixed(2)} nft=${claimedNftId} cyc=${posInCycle}/${cycleSize} fb=${usedFallback} | ${tokenSummary.join(' ')} | ${txHash.slice(0,10)}`);
+    await sendNotification(msg);
+  }
 }
 
 async function diagnoseTx(txHash) {
@@ -477,7 +478,8 @@ async function scanBlocks(fromBlock, toBlock) {
 }
 
 async function loadHistory() {
-  console.log('[HISTORY] Blockscout API...');
+  isLoadingHistory = true;
+  console.log('[HISTORY] Blockscout API... (bildirimler suspended)');
   try {
     const r = await axios.get(
       `https://base.blockscout.com/api/v2/addresses/${CONTRACT}/transactions`,
@@ -487,7 +489,7 @@ async function loadHistory() {
     console.log(`[HISTORY] ${items.length} TX`);
     const txs = items
       .filter(tx => tx.status === 'ok')
-      .sort((a, b) => a.block - b.block); // oldest first - buys before claims
+      .sort((a, b) => a.block - b.block);
     for (const tx of txs) {
       try {
         const blockTs  = Math.floor(new Date(tx.timestamp).getTime() / 1000);
@@ -497,6 +499,8 @@ async function loadHistory() {
       } catch (e) { console.error('[HISTORY tx]', e.message); }
     }
   } catch (e) { console.error('[HISTORY]', e.message); }
+  isLoadingHistory = false;
+  console.log('[HISTORY] Bitti — bildirimler açık');
 }
 
 async function pollLoop() {
