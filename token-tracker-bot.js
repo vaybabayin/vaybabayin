@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v9.6';
+const VERSION = 'v9.7';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -28,10 +28,10 @@ const RPCS = [
   'https://base.blockscout.com/api/eth-rpc',
 ].filter(Boolean);
 
-// target = cycle size per tier (opal=200, jade=100)
+// target = cycle size; outlierMax = price-lookup sanity cap (claims above this are dropped as bad data)
 const TIER_INFO = {
-  1: { name: 'opal', emoji: '💎', nominalUsd: 1, target: SC1_TARGET },
-  2: { name: 'jade', emoji: '🎱', nominalUsd: 5, target: SC5_TARGET },
+  1: { name: 'opal', emoji: '💎', nominalUsd: 1, target: SC1_TARGET, outlierMax: 10  },
+  2: { name: 'jade', emoji: '🎱', nominalUsd: 5, target: SC5_TARGET, outlierMax: 50  },
 };
 
 const CLAIM_SELECTORS = new Set([
@@ -211,8 +211,13 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
     const arr = [...processedTxs]; processedTxs = new Set(arr.slice(-10000));
   }
 
-  const tierFromCalldata = decodeTier(data);
-  if (tierFromCalldata !== null && !TIER_INFO[tierFromCalldata]) return;
+  // STRICT tier detection: require valid 330-byte calldata. No USD heuristic fallback.
+  const tier = decodeTier(data);
+  if (tier === null) return; // calldata didn't decode — unknown tier, skip
+  if (!TIER_INFO[tier])  return; // tier 3+, skip
+
+  const tierInfo = TIER_INFO[tier];
+  const cycleSize = tierInfo.target;
 
   let receipt;
   try { receipt = await provider.getTransactionReceipt(txHash); } catch (_) { return; }
@@ -250,6 +255,7 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
 
   let totalUsd = 0;
   const tokenSummary = [];
+  const droppedSummary = [];
   for (const [addr, rawAmt] of Object.entries(received)) {
     try {
       const info  = await getTokenInfo(addr);
@@ -258,6 +264,12 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
       if (!price) continue;
       const usd = human * price;
       if (usd < 0.0001) continue;
+      // per-token outlier guard: a single token contributing more than 100x nominal is almost
+      // certainly a price-lookup error (wrong pool / wrong decimals). Drop it.
+      if (usd > tierInfo.nominalUsd * 100) {
+        droppedSummary.push(`${info.symbol}=$${usd.toFixed(2)}(SKIP)`);
+        continue;
+      }
       totalUsd += usd;
       tokenSummary.push(`${info.symbol}=$${usd.toFixed(4)}`);
     } catch (_) {}
@@ -265,12 +277,13 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
 
   if (totalUsd <= 0) return;
 
-  const tier = tierFromCalldata ?? (totalUsd >= 2.5 ? 2 : 1);
-  if (!TIER_INFO[tier]) return;
-  const tierInfo = TIER_INFO[tier];
-  const cycleSize = tierInfo.target; // opal=200, jade=100
-  const state     = ts(tier);
+  // total-value outlier guard — final safety net
+  if (totalUsd > tierInfo.outlierMax) {
+    console.log(`[SKIP outlier] ${tierInfo.name} $${totalUsd.toFixed(2)} > $${tierInfo.outlierMax} (${droppedSummary.concat(tokenSummary).join(' ')}) | ${txHash.slice(0,10)}`);
+    return;
+  }
 
+  const state = ts(tier);
   if (state.history.length > 0) {
     const dir = totalUsd >= state.history[0].usd ? 'up' : 'down';
     state.streak    = dir === state.streakDir ? state.streak + 1 : 1;
@@ -511,7 +524,7 @@ async function main() {
   });
 
   console.log(`[${VERSION}] Contract: ${CONTRACT}`);
-  console.log(`[${VERSION}] opal döngü=${SC1_TARGET} | jade döngü=${SC5_TARGET}`);
+  console.log(`[${VERSION}] opal döngü=${SC1_TARGET} outlier=$${TIER_INFO[1].outlierMax} | jade döngü=${SC5_TARGET} outlier=$${TIER_INFO[2].outlierMax}`);
   await loadHistory();
   console.log(`[HISTORY] opal=${ts(1).count}/${SC1_TARGET}  jade=${ts(2).count}/${SC5_TARGET}`);
   lastPollBlock = 0;
