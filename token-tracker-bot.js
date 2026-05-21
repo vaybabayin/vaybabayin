@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v9.2';
+const VERSION = 'v9.3';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -11,9 +11,10 @@ const SC1_TARGET    = parseInt(process.env.SC1_TARGET || '200');
 const SC5_TARGET    = parseInt(process.env.SC5_TARGET || '100');
 
 if (!TELEGRAM_TOKEN) { console.error('TELEGRAM_BOT_TOKEN eksik!'); process.exit(1); }
-if (!CHANNEL_ID) console.warn('[WARN] TELEGRAM_CHANNEL_ID ayarlı değil');
+if (!CHANNEL_ID) console.warn('[WARN] TELEGRAM_CHANNEL_ID ayarli degil — bildirimler gönderilmeyecek!');
 
 const CONTRACT_LOWER = CONTRACT.toLowerCase();
+const ZERO_ADDRESS   = '0x0000000000000000000000000000000000000000';
 
 const RPCS = [
   'https://mainnet.base.org',
@@ -58,6 +59,7 @@ const WETH             = '0x4200000000000000000000000000000000000006';
 const USDC             = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
 const UNI_FACTORY      = '0x33128a8fC17869897dcE68Ed026d694621f6FDfD';
 const AERO_FACTORY     = '0x420DD381b31aEf6683db6B902084cB0FFECe40Da';
+const WETH_LOWER       = WETH.toLowerCase();
 const CYCLE_SIZE       = 50;
 
 const tierStates = {};
@@ -86,7 +88,7 @@ async function getProvider() {
       return p;
     } catch (e) { console.log(`[RPC ✗] ${e.message.slice(0, 70)}`); }
   }
-  throw new Error('Hiçbir RPC bağlanamadı');
+  throw new Error('Hiçbir RPC baglanamadi');
 }
 
 async function getEthUsd() {
@@ -190,10 +192,18 @@ function overallAvg(tierNum) {
 }
 
 async function sendNotification(msg) {
-  if (!CHANNEL_ID) return;
+  if (!CHANNEL_ID) {
+    console.warn('[TG] CHANNEL_ID yok, bildirim atlanıyor');
+    return;
+  }
   try {
     await bot.sendMessage(CHANNEL_ID, msg, { parse_mode: 'HTML', disable_web_page_preview: true });
-  } catch (e) { console.error('[TG send]', e.message); }
+  } catch (e) {
+    console.error(`[TG HATA] Kanal: ${CHANNEL_ID} | Hata: ${e.message}`);
+    if (e.message?.includes('chat not found') || e.message?.includes('bot was kicked')) {
+      console.error('[TG HATA] Botu kanala/gruba admin olarak ekle veya CHANNEL_ID doğru mu kontrol et!');
+    }
+  }
 }
 
 async function processClaimTx(txHash, from, data, blockNum, blockTs) {
@@ -209,10 +219,10 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
 
   const claimer = from.toLowerCase();
 
-  // Only accept ERC20 transfers where:
-  //   (a) the token contract IS our scratch card contract, OR
-  //   (b) the transfer is FROM our scratch card contract
-  // This filters out WETH swaps, DEX router transfers, etc. in the same TX.
+  // First pass: accept transfers where:
+  //   (a) token address IS our scratch card contract
+  //   (b) transfer is FROM our scratch card contract (contract holds tokens)
+  //   (c) transfer is a MINT (from=0x0) — contract mints reward tokens
   const received = {};
   for (const log of receipt.logs) {
     if (log.topics[0]?.toLowerCase() !== TRANSFER_TOPIC) continue;
@@ -221,40 +231,56 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
     const fromLog  = ('0x' + log.topics[1].slice(26)).toLowerCase();
     const tokenAddr = log.address.toLowerCase();
     if (to !== claimer) continue;
-    if (tokenAddr !== CONTRACT_LOWER && fromLog !== CONTRACT_LOWER) continue; // skip unrelated
+    const isContractToken = tokenAddr === CONTRACT_LOWER;
+    const isFromContract  = fromLog === CONTRACT_LOWER;
+    const isMint          = fromLog === ZERO_ADDRESS;
+    if (!isContractToken && !isFromContract && !isMint) continue;
     const amount = BigInt(log.data);
     received[tokenAddr] = (received[tokenAddr] ?? 0n) + amount;
   }
 
+  // Fallback: any transfer to claimer, but exclude WETH (always DEX mechanics)
   if (!Object.keys(received).length) {
-    // Fallback: accept any transfer TO claimer (older behaviour) only if no contract-filtered result
     for (const log of receipt.logs) {
       if (log.topics[0]?.toLowerCase() !== TRANSFER_TOPIC) continue;
       if (log.topics.length < 3) continue;
       const to = ('0x' + log.topics[2].slice(26)).toLowerCase();
       if (to !== claimer) continue;
       const tokenAddr = log.address.toLowerCase();
+      if (tokenAddr === WETH_LOWER) continue; // always skip WETH in fallback
       const amount = BigInt(log.data);
       received[tokenAddr] = (received[tokenAddr] ?? 0n) + amount;
     }
   }
 
-  if (!Object.keys(received).length) return;
+  if (!Object.keys(received).length) {
+    console.log(`[SKIP] ${txHash.slice(0,10)} — claimer'a transfer yok`);
+    return;
+  }
 
-  let bestUsd = 0, bestToken = null;
+  let bestUsd = 0, bestToken = null, bestHuman = 0;
   for (const [addr, rawAmt] of Object.entries(received)) {
     try {
       const info  = await getTokenInfo(addr);
       const human = Number(ethers.formatUnits(rawAmt, info.decimals));
       const price = await getTokenPriceUsd(addr);
-      if (!price) { console.log(`[NO PRICE] ${info.symbol || addr.slice(0,10)}`); continue; }
+      if (!price) {
+        console.log(`[NO PRICE] ${info.symbol || addr.slice(0,10)} amt=${human.toFixed(4)}`);
+        // Still track as candidate — will be used if nothing better found
+        if (!bestToken) { bestToken = { addr, ...info, price: 0 }; bestHuman = human; }
+        continue;
+      }
       const usd = human * price;
       console.log(`[TOKEN] ${info.symbol} amt=${human.toFixed(4)} price=$${price.toExponential(3)} => $${usd.toFixed(4)}`);
-      if (usd > bestUsd) { bestUsd = usd; bestToken = { addr, ...info, price }; }
+      if (usd > bestUsd) { bestUsd = usd; bestToken = { addr, ...info, price }; bestHuman = human; }
     } catch (_) {}
   }
 
-  if (!bestToken || bestUsd <= 0) return;
+  // Even if no price found, still notify — better than silence
+  if (!bestToken) {
+    console.log(`[SKIP] ${txHash.slice(0,10)} — token bilgisi alınamadı`);
+    return;
+  }
 
   const tier     = decodeTier(data) ?? (bestUsd >= 2.5 ? 2 : 1);
   const tierInfo = getTierInfo(tier);
@@ -273,8 +299,9 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
   state.history.unshift({ usd: bestUsd, ts: blockTs * 1000, hash: txHash, claimer: from });
   if (state.history.length > 200) state.history.pop();
 
-  const date  = new Date(blockTs * 1000).toISOString().replace('T', ' ').slice(0, 19) + 'Z';
-  const txUrl = `https://basescan.org/tx/${txHash}`;
+  const date   = new Date(blockTs * 1000).toISOString().replace('T', ' ').slice(0, 19) + 'Z';
+  const txUrl  = `https://basescan.org/tx/${txHash}`;
+  const usdStr = bestUsd > 0 ? `$${bestUsd.toFixed(2)}` : `${bestHuman.toFixed(2)} ${bestToken.symbol}`;
 
   if (TIER_INFO[tier]) {
     const posInCycle = ((state.count - 1) % CYCLE_SIZE) + 1;
@@ -285,18 +312,18 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
       .filter(Boolean).join(' | ');
     const sEmoji = state.streakDir === 'down' ? '🔴' : '🟢';
     const msg = [
-      `${tierInfo.emoji} Total Value: $${bestUsd.toFixed(2)} [${tierInfo.name}]`,
+      `${tierInfo.emoji} Total Value: ${usdStr} [${tierInfo.name}]`,
       `📍 Döngü: ${posInCycle}/${CYCLE_SIZE} (~${remaining} kaldı) — Döngü Avg: $${cycleAvg.toFixed(2)}`,
       `${sEmoji} Streak: ${state.streak}`,
       avgLine ? `📊 ${avgLine}` : null,
       `👤 ${from}`,
       `🕐 ${date} | <a href="${txUrl}">TX</a>`,
     ].filter(Boolean).join('\n');
-    console.log(`[✓] ${tierInfo.name} $${bestUsd.toFixed(2)} cycle=${posInCycle}/${CYCLE_SIZE} streak=${state.streak} | ${txHash.slice(0,10)}`);
+    console.log(`[✓] ${tierInfo.name} ${usdStr} cycle=${posInCycle}/${CYCLE_SIZE} streak=${state.streak} | ${txHash.slice(0,10)}`);
     await sendNotification(msg);
   } else {
-    const msg = `${tierInfo.emoji} $${bestUsd.toFixed(2)} [${tierInfo.name}] 👤 ${from} 🕐 ${date} | <a href="${txUrl}">TX</a>`;
-    console.log(`[spam] tier${tier} $${bestUsd.toFixed(2)} | ${txHash.slice(0,10)}`);
+    const msg = `${tierInfo.emoji} ${usdStr} [${tierInfo.name}] 👤 ${from} 🕐 ${date} | <a href="${txUrl}">TX</a>`;
+    console.log(`[spam] tier${tier} ${usdStr} | ${txHash.slice(0,10)}`);
     await sendNotification(msg);
   }
 }
@@ -474,6 +501,25 @@ async function main() {
   bot.onText(/\/sc1/,   (msg) => bot.sendMessage(msg.chat.id, buildTierMsg(1), { parse_mode: 'HTML' }).catch(console.error));
   bot.onText(/\/sc5/,   (msg) => bot.sendMessage(msg.chat.id, buildTierMsg(2), { parse_mode: 'HTML' }).catch(console.error));
 
+  // /test — sends a test message to CHANNEL_ID to verify the channel is configured correctly
+  bot.onText(/\/test/, async (msg) => {
+    const chatId = msg.chat.id;
+    if (!CHANNEL_ID) {
+      await bot.sendMessage(chatId, '❌ TELEGRAM_CHANNEL_ID ayarlı değil!');
+      return;
+    }
+    try {
+      await bot.sendMessage(CHANNEL_ID,
+        `✅ <b>Test mesajı</b> ${VERSION}\n📡 Bot çalışıyor, kanal bağlantısı tamam!`,
+        { parse_mode: 'HTML' }
+      );
+      await bot.sendMessage(chatId, `✅ Test mesajı ${CHANNEL_ID} kanalına gönderildi!`);
+    } catch (e) {
+      await bot.sendMessage(chatId,
+        `❌ Kanal hatası: ${e.message}\n\nKontrol et:\n• Botu kanala admin olarak ekle\n• CHANNEL_ID doğru mu? (örn: -1001234567890)`);
+    }
+  });
+
   bot.on('message', (msg) => {
     const text = (msg.text || '').trim();
     if (text.startsWith('/')) return;
@@ -485,7 +531,7 @@ async function main() {
     if (e.message?.includes('409')) {
       pollingErrCount++;
       if (pollingErrCount === 1)
-        console.error('[TG] 409 Conflict — başka bir instance aktif!');
+        console.error('[TG] 409 Conflict — baska bir instance aktif! Northflank\'ta eski servisi durdur.');
       if (pollingErrCount > 80) { process.exit(1); }
     } else {
       pollingErrCount = 0;
