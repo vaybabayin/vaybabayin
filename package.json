@@ -1,6 +1,6 @@
 {
   "name": "token-tracker-bot",
-  "version": "9.4.0",
+  "version": "9.5.0",
   "main": "token-tracker-bot.js",
   "scripts": { "start": "node token-tracker-bot.js" },
   "engines": { "node": ">=18" },
