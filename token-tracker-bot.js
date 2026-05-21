@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v9.5';
+const VERSION = 'v9.6';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -28,6 +28,7 @@ const RPCS = [
   'https://base.blockscout.com/api/eth-rpc',
 ].filter(Boolean);
 
+// target = cycle size per tier (opal=200, jade=100)
 const TIER_INFO = {
   1: { name: 'opal', emoji: '💎', nominalUsd: 1, target: SC1_TARGET },
   2: { name: 'jade', emoji: '🎱', nominalUsd: 5, target: SC5_TARGET },
@@ -59,7 +60,6 @@ const USDC             = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
 const UNI_FACTORY      = '0x33128a8fC17869897dcE68Ed026d694621f6FDfD';
 const AERO_FACTORY     = '0x420DD381b31aEf6683db6B902084cB0FFECe40Da';
 const WETH_LOWER       = WETH.toLowerCase();
-const CYCLE_SIZE       = 50;
 
 const tierStates = {};
 function ts(tier) {
@@ -211,9 +211,8 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
     const arr = [...processedTxs]; processedTxs = new Set(arr.slice(-10000));
   }
 
-  // Determine tier FIRST and skip non-opal/jade entirely
   const tierFromCalldata = decodeTier(data);
-  if (tierFromCalldata !== null && !TIER_INFO[tierFromCalldata]) return; // skip other tiers
+  if (tierFromCalldata !== null && !TIER_INFO[tierFromCalldata]) return;
 
   let receipt;
   try { receipt = await provider.getTransactionReceipt(txHash); } catch (_) { return; }
@@ -221,7 +220,6 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
 
   const claimer = from.toLowerCase();
 
-  // First pass: contract-originated or minted tokens to claimer
   const received = {};
   for (const log of receipt.logs) {
     if (log.topics[0]?.toLowerCase() !== TRANSFER_TOPIC) continue;
@@ -235,7 +233,6 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
     received[tokenAddr] = (received[tokenAddr] ?? 0n) + amount;
   }
 
-  // Fallback: any transfer to claimer except WETH
   if (!Object.keys(received).length) {
     for (const log of receipt.logs) {
       if (log.topics[0]?.toLowerCase() !== TRANSFER_TOPIC) continue;
@@ -251,7 +248,6 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
 
   if (!Object.keys(received).length) return;
 
-  // Sum USD value across ALL reward tokens
   let totalUsd = 0;
   const tokenSummary = [];
   for (const [addr, rawAmt] of Object.entries(received)) {
@@ -261,7 +257,7 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
       const price = await getTokenPriceUsd(addr);
       if (!price) continue;
       const usd = human * price;
-      if (usd < 0.0001) continue; // skip dust
+      if (usd < 0.0001) continue;
       totalUsd += usd;
       tokenSummary.push(`${info.symbol}=$${usd.toFixed(4)}`);
     } catch (_) {}
@@ -270,9 +266,10 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
   if (totalUsd <= 0) return;
 
   const tier = tierFromCalldata ?? (totalUsd >= 2.5 ? 2 : 1);
-  if (!TIER_INFO[tier]) return; // double check
+  if (!TIER_INFO[tier]) return;
   const tierInfo = TIER_INFO[tier];
-  const state    = ts(tier);
+  const cycleSize = tierInfo.target; // opal=200, jade=100
+  const state     = ts(tier);
 
   if (state.history.length > 0) {
     const dir = totalUsd >= state.history[0].usd ? 'up' : 'down';
@@ -285,12 +282,12 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
   state.count++;
   state.sessionCount++;
   state.history.unshift({ usd: totalUsd, ts: blockTs * 1000, hash: txHash, claimer: from });
-  if (state.history.length > 200) state.history.pop();
+  if (state.history.length > Math.max(cycleSize, 200)) state.history.pop();
 
-  const date   = new Date(blockTs * 1000).toISOString().replace('T', ' ').slice(0, 19) + 'Z';
-  const txUrl  = `https://basescan.org/tx/${txHash}`;
-  const posInCycle = ((state.count - 1) % CYCLE_SIZE) + 1;
-  const remaining  = CYCLE_SIZE - posInCycle;
+  const date       = new Date(blockTs * 1000).toISOString().replace('T', ' ').slice(0, 19) + 'Z';
+  const txUrl      = `https://basescan.org/tx/${txHash}`;
+  const posInCycle = ((state.count - 1) % cycleSize) + 1;
+  const remaining  = cycleSize - posInCycle;
   const cycleAvg   = state.history.slice(0, posInCycle).reduce((s, c) => s + c.usd, 0) / posInCycle;
   const avgLine    = [5, 10, 15, 20, 50, 100]
     .map(n => { const v = calcAvg(state.history, n); return v !== null ? `Avg${n} $${v.toFixed(2)}` : null; })
@@ -298,13 +295,13 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
   const sEmoji = state.streakDir === 'down' ? '🔴' : '🟢';
   const msg = [
     `${tierInfo.emoji} Total Value: $${totalUsd.toFixed(2)} [${tierInfo.name}]`,
-    `📍 Döngü: ${posInCycle}/${CYCLE_SIZE} (~${remaining} kaldı) — Döngü Avg: $${cycleAvg.toFixed(2)}`,
+    `📍 Döngü: ${posInCycle}/${cycleSize} (~${remaining} kaldı) — Döngü Avg: $${cycleAvg.toFixed(2)}`,
     `${sEmoji} Streak: ${state.streak}`,
     avgLine ? `📊 ${avgLine}` : null,
     `👤 ${from}`,
     `🕐 ${date} | <a href="${txUrl}">TX</a>`,
   ].filter(Boolean).join('\n');
-  console.log(`[✓] ${tierInfo.name} $${totalUsd.toFixed(2)} cyc=${posInCycle}/${CYCLE_SIZE} | ${tokenSummary.join(' ')} | ${txHash.slice(0,10)}`);
+  console.log(`[✓] ${tierInfo.name} $${totalUsd.toFixed(2)} cyc=${posInCycle}/${cycleSize} | ${tokenSummary.join(' ')} | ${txHash.slice(0,10)}`);
   await sendNotification(msg);
 }
 
@@ -393,10 +390,11 @@ async function pollLoop() {
 }
 
 function buildTierMsg(tierNum) {
-  const state    = ts(tierNum);
-  const tierInfo = TIER_INFO[tierNum];
+  const state     = ts(tierNum);
+  const tierInfo  = TIER_INFO[tierNum];
+  const cycleSize = tierInfo.target;
   if (!state.count) return `${tierInfo.emoji} Henüz ${tierInfo.name} kaydı yok.`;
-  const posInCycle = ((state.count - 1) % CYCLE_SIZE) + 1;
+  const posInCycle = ((state.count - 1) % cycleSize) + 1;
   const cycleAvg   = state.history.slice(0, posInCycle).reduce((s, c) => s + c.usd, 0) / posInCycle;
   const sEmoji     = state.streakDir === 'down' ? '🔴' : '🟢';
   const avgLines   = [5, 10, 15, 20, 50, 100]
@@ -405,8 +403,8 @@ function buildTierMsg(tierNum) {
   return [
     `${tierInfo.emoji} <b>${tierInfo.name.toUpperCase()} İstatistikleri</b> ${VERSION}`,
     '',
-    `Toplam: ${state.sessionCount}/${tierInfo.target}`,
-    `📍 Döngü: ${posInCycle}/${CYCLE_SIZE} — Avg: $${cycleAvg.toFixed(2)}`,
+    `Toplam: ${state.sessionCount}/${cycleSize}`,
+    `📍 Döngü: ${posInCycle}/${cycleSize} — Avg: $${cycleAvg.toFixed(2)}`,
     `${sEmoji} Streak: ${state.streak}`,
     '',
     avgLines || 'Yetersiz veri',
@@ -471,7 +469,7 @@ async function main() {
     const chatId = msg.chat.id;
     registeredChats.add(String(chatId));
     console.log(`[TG] Chat kaydedildi: ${chatId}`);
-    await bot.sendMessage(chatId, `✅ Bu chat bildirim listesine eklendi.`);
+    await bot.sendMessage(chatId, '✅ Bu chat bildirim listesine eklendi.');
   });
 
   bot.onText(/\/stop/, async (msg) => {
@@ -484,7 +482,7 @@ async function main() {
     registeredChats.add(String(chatId));
     try {
       await bot.sendMessage(chatId,
-        `✅ <b>Test mesajı</b> ${VERSION}\n📡 Bot çalışıyor!\n📋 Kayıtlı chat sayısı: ${registeredChats.size}\n💎 opal: ${ts(1).count} | 🎱 jade: ${ts(2).count}`,
+        `✅ <b>Test mesajı</b> ${VERSION}\n📡 Bot çalışıyor!\n📋 Kayıtlı chat: ${registeredChats.size}\n💎 opal (${SC1_TARGET}): ${ts(1).count} | 🎱 jade (${SC5_TARGET}): ${ts(2).count}`,
         { parse_mode: 'HTML' }
       );
     } catch (e) { console.error('[TEST]', e.message); }
@@ -504,7 +502,7 @@ async function main() {
     if (e.message?.includes('409')) {
       pollingErrCount++;
       if (pollingErrCount === 1)
-        console.error('[TG] 409 Conflict — başka bir instance aktif! Northflank\'taki eski servisi durdur!');
+        console.error('[TG] 409 Conflict — başka bir instance aktif! Eski servisi durdur.');
       if (pollingErrCount > 80) { process.exit(1); }
     } else {
       pollingErrCount = 0;
@@ -513,9 +511,9 @@ async function main() {
   });
 
   console.log(`[${VERSION}] Contract: ${CONTRACT}`);
-  console.log(`[${VERSION}] Sadece opal (tier 1) ve jade (tier 2) izleniyor`);
+  console.log(`[${VERSION}] opal döngü=${SC1_TARGET} | jade döngü=${SC5_TARGET}`);
   await loadHistory();
-  console.log(`[HISTORY] opal=${ts(1).count}  jade=${ts(2).count}`);
+  console.log(`[HISTORY] opal=${ts(1).count}/${SC1_TARGET}  jade=${ts(2).count}/${SC5_TARGET}`);
   lastPollBlock = 0;
   await pollLoop();
 }
