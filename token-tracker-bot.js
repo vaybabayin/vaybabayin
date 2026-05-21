@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v9.8';
+const VERSION = 'v9.9';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -28,11 +28,18 @@ const RPCS = [
   'https://base.blockscout.com/api/eth-rpc',
 ].filter(Boolean);
 
-// target = cycle size; outlierMax = price-lookup sanity cap
+// Tier USD ranges (calldata doesn't contain tier; classify by total value)
 const TIER_INFO = {
-  1: { name: 'opal', emoji: '\u{1F48E}', nominalUsd: 1, target: SC1_TARGET, outlierMax: 10  },
-  2: { name: 'jade', emoji: '\u{1F3B1}', nominalUsd: 5, target: SC5_TARGET, outlierMax: 50  },
+  1: { name: 'opal', emoji: '\u{1F48E}', nominalUsd: 1, target: SC1_TARGET, minUsd: 0.30, maxUsd: 2.50 },
+  2: { name: 'jade', emoji: '\u{1F3B1}', nominalUsd: 5, target: SC5_TARGET, minUsd: 2.50, maxUsd: 10.0 },
 };
+const PER_TOKEN_MAX_USD = 100; // any single token > $100 is a price-lookup error
+
+function classifyTier(totalUsd) {
+  for (const [n, info] of Object.entries(TIER_INFO))
+    if (totalUsd >= info.minUsd && totalUsd < info.maxUsd) return parseInt(n);
+  return null;
+}
 
 const CLAIM_SELECTORS = new Set([
   '0x4e71d92d', '0x379607f5', '0x1e83409a',
@@ -42,15 +49,7 @@ const CLAIM_SELECTORS = new Set([
 
 function isClaimInput(data) {
   if (!data || data.length < 10) return false;
-  if (CLAIM_SELECTORS.has(data.slice(0, 10).toLowerCase())) return true;
-  if (data.length === 330) return true;
-  return false;
-}
-
-function decodeTier(data) {
-  if (!data || data.length !== 330) return null;
-  const t = parseInt(data.slice(74, 138), 16);
-  return (t >= 1 && t <= 20) ? t : null;
+  return CLAIM_SELECTORS.has(data.slice(0, 10).toLowerCase());
 }
 
 const TRANSFER_TOPIC   = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
@@ -204,35 +203,8 @@ async function sendNotification(msg) {
   }
 }
 
-async function processClaimTx(txHash, from, data, blockNum, blockTs) {
-  if (processedTxs.has(txHash)) return;
-  processedTxs.add(txHash);
-  if (processedTxs.size > 20000) {
-    const arr = [...processedTxs]; processedTxs = new Set(arr.slice(-10000));
-  }
-
-  const tier = decodeTier(data);
-  if (tier === null) {
-    console.log(`[SKIP calldata] len=${data.length} sel=${data.slice(0,10)} | ${txHash.slice(0,10)}`);
-    return;
-  }
-  if (!TIER_INFO[tier]) {
-    console.log(`[SKIP tier=${tier}] | ${txHash.slice(0,10)}`);
-    return;
-  }
-
-  const tierInfo = TIER_INFO[tier];
-  const cycleSize = tierInfo.target;
-
-  let receipt;
-  try { receipt = await provider.getTransactionReceipt(txHash); } catch (_) { return; }
-  if (!receipt || receipt.status === 0) {
-    console.log(`[SKIP receipt] status=${receipt?.status ?? 'null'} | ${txHash.slice(0,10)}`);
-    return;
-  }
-
-  const claimer = from.toLowerCase();
-
+// Collect reward token transfers to claimer. Returns {received, usedFallback}.
+function collectReceived(receipt, claimer) {
   const received = {};
   for (const log of receipt.logs) {
     if (log.topics[0]?.toLowerCase() !== TRANSFER_TOPIC) continue;
@@ -242,29 +214,22 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
     const tokenAddr = log.address.toLowerCase();
     if (to !== claimer) continue;
     if (tokenAddr !== CONTRACT_LOWER && fromLog !== CONTRACT_LOWER && fromLog !== ZERO_ADDRESS) continue;
-    const amount = BigInt(log.data);
-    received[tokenAddr] = (received[tokenAddr] ?? 0n) + amount;
+    received[tokenAddr] = (received[tokenAddr] ?? 0n) + BigInt(log.data);
   }
-
-  const usedFallback = !Object.keys(received).length;
-  if (usedFallback) {
-    for (const log of receipt.logs) {
-      if (log.topics[0]?.toLowerCase() !== TRANSFER_TOPIC) continue;
-      if (log.topics.length < 3) continue;
-      const to = ('0x' + log.topics[2].slice(26)).toLowerCase();
-      if (to !== claimer) continue;
-      const tokenAddr = log.address.toLowerCase();
-      if (tokenAddr === WETH_LOWER) continue;
-      const amount = BigInt(log.data);
-      received[tokenAddr] = (received[tokenAddr] ?? 0n) + amount;
-    }
+  if (Object.keys(received).length) return { received, usedFallback: false };
+  for (const log of receipt.logs) {
+    if (log.topics[0]?.toLowerCase() !== TRANSFER_TOPIC) continue;
+    if (log.topics.length < 3) continue;
+    const to = ('0x' + log.topics[2].slice(26)).toLowerCase();
+    if (to !== claimer) continue;
+    const tokenAddr = log.address.toLowerCase();
+    if (tokenAddr === WETH_LOWER) continue;
+    received[tokenAddr] = (received[tokenAddr] ?? 0n) + BigInt(log.data);
   }
+  return { received, usedFallback: true };
+}
 
-  if (!Object.keys(received).length) {
-    console.log(`[SKIP no-transfer] fallback=${usedFallback} claimer=${claimer.slice(0,10)} | ${txHash.slice(0,10)}`);
-    return;
-  }
-
+async function valueReceived(received) {
   let totalUsd = 0;
   const tokenSummary = [];
   const droppedSummary = [];
@@ -273,30 +238,54 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
       const info  = await getTokenInfo(addr);
       const human = Number(ethers.formatUnits(rawAmt, info.decimals));
       const price = await getTokenPriceUsd(addr);
-      if (!price) {
-        droppedSummary.push(`${info.symbol}=NO_PRICE`);
-        continue;
-      }
+      if (!price) { droppedSummary.push(`${info.symbol}=NO_PRICE`); continue; }
       const usd = human * price;
       if (usd < 0.0001) continue;
-      if (usd > tierInfo.nominalUsd * 100) {
-        droppedSummary.push(`${info.symbol}=$${usd.toFixed(2)}(OUTLIER_TOKEN)`);
+      if (usd > PER_TOKEN_MAX_USD) {
+        droppedSummary.push(`${info.symbol}=$${usd.toFixed(2)}(OUTLIER)`);
         continue;
       }
       totalUsd += usd;
       tokenSummary.push(`${info.symbol}=$${usd.toFixed(4)}`);
     } catch (_) {}
   }
+  return { totalUsd, tokenSummary, droppedSummary };
+}
 
+async function processClaimTx(txHash, from, data, blockNum, blockTs) {
+  if (processedTxs.has(txHash)) return;
+  processedTxs.add(txHash);
+  if (processedTxs.size > 20000) {
+    const arr = [...processedTxs]; processedTxs = new Set(arr.slice(-10000));
+  }
+
+  let receipt;
+  try { receipt = await provider.getTransactionReceipt(txHash); } catch (_) { return; }
+  if (!receipt || receipt.status === 0) {
+    console.log(`[SKIP receipt] status=${receipt?.status ?? 'null'} | ${txHash.slice(0,10)}`);
+    return;
+  }
+
+  const claimer = from.toLowerCase();
+  const { received, usedFallback } = collectReceived(receipt, claimer);
+  if (!Object.keys(received).length) {
+    console.log(`[SKIP no-transfer] | ${txHash.slice(0,10)}`);
+    return;
+  }
+
+  const { totalUsd, tokenSummary, droppedSummary } = await valueReceived(received);
   if (totalUsd <= 0) {
     console.log(`[SKIP no-value] dropped=[${droppedSummary.join(' ')}] | ${txHash.slice(0,10)}`);
     return;
   }
 
-  if (totalUsd > tierInfo.outlierMax) {
-    console.log(`[SKIP outlier] ${tierInfo.name} $${totalUsd.toFixed(2)} > $${tierInfo.outlierMax} tokens=[${tokenSummary.concat(droppedSummary).join(' ')}] | ${txHash.slice(0,10)}`);
+  const tier = classifyTier(totalUsd);
+  if (tier === null) {
+    console.log(`[SKIP usd-range] $${totalUsd.toFixed(2)} (tier 3+ or anomaly) tokens=[${tokenSummary.join(' ')}] | ${txHash.slice(0,10)}`);
     return;
   }
+  const tierInfo = TIER_INFO[tier];
+  const cycleSize = tierInfo.target;
 
   const state = ts(tier);
   if (state.history.length > 0) {
@@ -333,57 +322,36 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
   await sendNotification(msg);
 }
 
-// Diagnose a specific TX: fetch and run full processClaimTx logic with verbose report
 async function diagnoseTx(txHash) {
   const lines = [`🔍 TX: <code>${txHash}</code>`];
   try {
     const tx = await provider.getTransaction(txHash);
-    if (!tx) { lines.push('❌ TX bulunamadı (hash yanlış olabilir)'); return lines.join('\n'); }
+    if (!tx) { lines.push('❌ TX bulunamadı'); return lines.join('\n'); }
 
     const data = tx.data || '';
-    lines.push(`📝 Calldata uzunluğu: ${data.length} char (beklenen: 330)`);
-    lines.push(`🔢 Selector: ${data.slice(0, 10)}`);
-
-    const tier = decodeTier(data);
-    if (tier === null) {
-      lines.push(`⛔ decodeTier: null — calldata 330 değil veya tier aralık dışında (SKIP)`);
-    } else if (!TIER_INFO[tier]) {
-      lines.push(`⛔ Tier ${tier} — sadece 1 (opal) ve 2 (jade) işleniyor (SKIP)`);
-    } else {
-      lines.push(`✅ Tier: ${tier} (${TIER_INFO[tier].name} $${TIER_INFO[tier].nominalUsd})`);
-    }
+    lines.push(`📝 Calldata: ${data.length} char, selector ${data.slice(0, 10)}`);
 
     const receipt = await provider.getTransactionReceipt(txHash);
-    if (!receipt) {
-      lines.push('❌ Receipt: null');
-      return lines.join('\n');
-    }
-    lines.push(`📜 Receipt status: ${receipt.status === 1 ? '✅ OK' : '❌ FAIL'}`);
+    if (!receipt) { lines.push('❌ Receipt: null'); return lines.join('\n'); }
+    lines.push(`📜 Status: ${receipt.status === 1 ? '✅' : '❌'}`);
 
     const claimer = tx.from.toLowerCase();
-    lines.push(`👤 From: ${tx.from}`);
+    const { received, usedFallback } = collectReceived(receipt, claimer);
+    lines.push(`💸 Token transferleri: ${Object.keys(received).length} (fallback: ${usedFallback ? 'evet' : 'hayır'})`);
 
-    let fp = 0, transfers = 0;
-    const tokenDetails = [];
-    for (const log of receipt.logs) {
-      if (log.topics[0]?.toLowerCase() !== TRANSFER_TOPIC) continue;
-      if (log.topics.length < 3) continue;
-      const toAddr   = ('0x' + log.topics[2].slice(26)).toLowerCase();
-      if (toAddr !== claimer) continue;
-      transfers++;
-      const fromLog  = ('0x' + log.topics[1].slice(26)).toLowerCase();
-      const tokenAddr = log.address.toLowerCase();
-      const passes = tokenAddr === CONTRACT_LOWER || fromLog === CONTRACT_LOWER || fromLog === ZERO_ADDRESS;
-      if (passes) fp++;
-      tokenDetails.push(
-        `  ${passes ? '✓' : '✗'} token=${tokenAddr.slice(0,12)} from=${fromLog.slice(0,12)} ${tokenAddr===WETH_LOWER?'[WETH]':''}`.trim()
-      );
-    }
-    lines.push(`💸 Claimer'a transfer: ${transfers} (ilk filtre geçen: ${fp}, fallback: ${fp===0?'evet':'hayır'})`);
-    lines.push(...tokenDetails);
+    if (!Object.keys(received).length) { lines.push('⛔ Hiç ödül transferi yok — SKIP'); return lines.join('\n'); }
 
+    const { totalUsd, tokenSummary, droppedSummary } = await valueReceived(received);
+    for (const t of tokenSummary)   lines.push(`  ✓ ${t}`);
+    for (const d of droppedSummary) lines.push(`  ✗ ${d}`);
+    lines.push(`💰 Total: $${totalUsd.toFixed(4)}`);
+
+    const tier = classifyTier(totalUsd);
+    if (tier === null) lines.push(`⛔ USD aralık dışı (opal $0.30–$2.50, jade $2.50–$10) — SKIP`);
+    else lines.push(`✅ Tier: ${tier} (${TIER_INFO[tier].name})`);
+
+    if (processedTxs.has(txHash)) lines.push('⚠️ Bu TX zaten işlendi');
     lines.push(`📡 Kayıtlı chat: ${registeredChats.size}`);
-    if (processedTxs.has(txHash)) lines.push('⚠️ Bu TX zaten işlendi (processedTxs’ta var)');
   } catch (e) {
     lines.push(`❌ Hata: ${e.message.slice(0, 200)}`);
   }
@@ -432,7 +400,7 @@ async function loadHistory() {
         const method = (tx.method || '').toLowerCase();
         if (method.includes('claim') || method.includes('redeem') || method.includes('scratch')) return true;
         const raw = tx.raw_input || '';
-        return CLAIM_SELECTORS.has(raw.slice(0, 10).toLowerCase()) || raw.length === 330;
+        return CLAIM_SELECTORS.has(raw.slice(0, 10).toLowerCase());
       })
       .sort((a, b) => a.block - b.block);
     console.log(`[HISTORY] ${claimTxs.length} claim TX`);
@@ -576,7 +544,6 @@ async function main() {
   bot.onText(/\/sc1/, (msg) => bot.sendMessage(msg.chat.id, buildTierMsg(1), { parse_mode: 'HTML' }).catch(console.error));
   bot.onText(/\/sc5/, (msg) => bot.sendMessage(msg.chat.id, buildTierMsg(2), { parse_mode: 'HTML' }).catch(console.error));
 
-  // /diag <txhash> — diagnose why a specific TX was or wasn't shown
   bot.onText(/\/diag (.+)/, async (msg, match) => {
     const chatId = msg.chat.id;
     const txHash = match[1].trim();
@@ -605,7 +572,7 @@ async function main() {
   });
 
   console.log(`[${VERSION}] Contract: ${CONTRACT}`);
-  console.log(`[${VERSION}] opal döngü=${SC1_TARGET} outlier=$${TIER_INFO[1].outlierMax} | jade döngü=${SC5_TARGET} outlier=$${TIER_INFO[2].outlierMax}`);
+  console.log(`[${VERSION}] opal $${TIER_INFO[1].minUsd}-$${TIER_INFO[1].maxUsd} döngü=${SC1_TARGET} | jade $${TIER_INFO[2].minUsd}-$${TIER_INFO[2].maxUsd} döngü=${SC5_TARGET}`);
   await loadHistory();
   console.log(`[HISTORY] opal=${ts(1).count}/${SC1_TARGET}  jade=${ts(2).count}/${SC5_TARGET}`);
   lastPollBlock = 0;
