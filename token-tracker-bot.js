@@ -3,18 +3,22 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v9.3';
+const VERSION = 'v9.4';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID;
+const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null; // optional
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
 const SC1_TARGET    = parseInt(process.env.SC1_TARGET || '200');
 const SC5_TARGET    = parseInt(process.env.SC5_TARGET || '100');
 
 if (!TELEGRAM_TOKEN) { console.error('TELEGRAM_BOT_TOKEN eksik!'); process.exit(1); }
-if (!CHANNEL_ID) console.warn('[WARN] TELEGRAM_CHANNEL_ID ayarli degil — bildirimler gönderilmeyecek!');
 
 const CONTRACT_LOWER = CONTRACT.toLowerCase();
 const ZERO_ADDRESS   = '0x0000000000000000000000000000000000000000';
+
+// Registered chats that receive notifications
+// Seeded from CHANNEL_ID env if provided, plus anyone who sends /start
+const registeredChats = new Set();
+if (CHANNEL_ID) registeredChats.add(String(CHANNEL_ID));
 
 const RPCS = [
   'https://mainnet.base.org',
@@ -88,7 +92,7 @@ async function getProvider() {
       return p;
     } catch (e) { console.log(`[RPC ✗] ${e.message.slice(0, 70)}`); }
   }
-  throw new Error('Hiçbir RPC baglanamadi');
+  throw new Error('Hiçbir RPC bağlanamadı');
 }
 
 async function getEthUsd() {
@@ -192,16 +196,19 @@ function overallAvg(tierNum) {
 }
 
 async function sendNotification(msg) {
-  if (!CHANNEL_ID) {
-    console.warn('[TG] CHANNEL_ID yok, bildirim atlanıyor');
+  if (registeredChats.size === 0) {
+    console.warn('[TG] Kayıtlı chat yok — bota /start gönder');
     return;
   }
-  try {
-    await bot.sendMessage(CHANNEL_ID, msg, { parse_mode: 'HTML', disable_web_page_preview: true });
-  } catch (e) {
-    console.error(`[TG HATA] Kanal: ${CHANNEL_ID} | Hata: ${e.message}`);
-    if (e.message?.includes('chat not found') || e.message?.includes('bot was kicked')) {
-      console.error('[TG HATA] Botu kanala/gruba admin olarak ekle veya CHANNEL_ID doğru mu kontrol et!');
+  for (const chatId of registeredChats) {
+    try {
+      await bot.sendMessage(chatId, msg, { parse_mode: 'HTML', disable_web_page_preview: true });
+    } catch (e) {
+      console.error(`[TG HATA] chat=${chatId} | ${e.message}`);
+      if (e.message?.includes('bot was blocked') || e.message?.includes('chat not found')) {
+        registeredChats.delete(chatId);
+        console.warn(`[TG] ${chatId} listeden çıkarıldı`);
+      }
     }
   }
 }
@@ -219,10 +226,7 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
 
   const claimer = from.toLowerCase();
 
-  // First pass: accept transfers where:
-  //   (a) token address IS our scratch card contract
-  //   (b) transfer is FROM our scratch card contract (contract holds tokens)
-  //   (c) transfer is a MINT (from=0x0) — contract mints reward tokens
+  // First pass: contract-originated or minted tokens
   const received = {};
   for (const log of receipt.logs) {
     if (log.topics[0]?.toLowerCase() !== TRANSFER_TOPIC) continue;
@@ -231,15 +235,12 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
     const fromLog  = ('0x' + log.topics[1].slice(26)).toLowerCase();
     const tokenAddr = log.address.toLowerCase();
     if (to !== claimer) continue;
-    const isContractToken = tokenAddr === CONTRACT_LOWER;
-    const isFromContract  = fromLog === CONTRACT_LOWER;
-    const isMint          = fromLog === ZERO_ADDRESS;
-    if (!isContractToken && !isFromContract && !isMint) continue;
+    if (tokenAddr !== CONTRACT_LOWER && fromLog !== CONTRACT_LOWER && fromLog !== ZERO_ADDRESS) continue;
     const amount = BigInt(log.data);
     received[tokenAddr] = (received[tokenAddr] ?? 0n) + amount;
   }
 
-  // Fallback: any transfer to claimer, but exclude WETH (always DEX mechanics)
+  // Fallback: any transfer to claimer except WETH
   if (!Object.keys(received).length) {
     for (const log of receipt.logs) {
       if (log.topics[0]?.toLowerCase() !== TRANSFER_TOPIC) continue;
@@ -247,7 +248,7 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
       const to = ('0x' + log.topics[2].slice(26)).toLowerCase();
       if (to !== claimer) continue;
       const tokenAddr = log.address.toLowerCase();
-      if (tokenAddr === WETH_LOWER) continue; // always skip WETH in fallback
+      if (tokenAddr === WETH_LOWER) continue;
       const amount = BigInt(log.data);
       received[tokenAddr] = (received[tokenAddr] ?? 0n) + amount;
     }
@@ -266,7 +267,6 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
       const price = await getTokenPriceUsd(addr);
       if (!price) {
         console.log(`[NO PRICE] ${info.symbol || addr.slice(0,10)} amt=${human.toFixed(4)}`);
-        // Still track as candidate — will be used if nothing better found
         if (!bestToken) { bestToken = { addr, ...info, price: 0 }; bestHuman = human; }
         continue;
       }
@@ -276,7 +276,6 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
     } catch (_) {}
   }
 
-  // Even if no price found, still notify — better than silence
   if (!bestToken) {
     console.log(`[SKIP] ${txHash.slice(0,10)} — token bilgisi alınamadı`);
     return;
@@ -319,7 +318,7 @@ async function processClaimTx(txHash, from, data, blockNum, blockTs) {
       `👤 ${from}`,
       `🕐 ${date} | <a href="${txUrl}">TX</a>`,
     ].filter(Boolean).join('\n');
-    console.log(`[✓] ${tierInfo.name} ${usdStr} cycle=${posInCycle}/${CYCLE_SIZE} streak=${state.streak} | ${txHash.slice(0,10)}`);
+    console.log(`[✓] ${tierInfo.name} ${usdStr} cycle=${posInCycle}/${CYCLE_SIZE} | ${txHash.slice(0,10)}`);
     await sendNotification(msg);
   } else {
     const msg = `${tierInfo.emoji} ${usdStr} [${tierInfo.name}] 👤 ${from} 🕐 ${date} | <a href="${txUrl}">TX</a>`;
@@ -436,6 +435,11 @@ function buildTierMsg(tierNum) {
 const TIERS_ORDER = [1, 2];
 
 async function startConversation(chatId) {
+  // Register this chat for notifications
+  const isNew = !registeredChats.has(String(chatId));
+  registeredChats.add(String(chatId));
+  if (isNew) console.log(`[TG] Yeni chat kaydedildi: ${chatId} (toplam: ${registeredChats.size})`);
+
   const lines = [`👋 <b>Scratch Card Tracker</b> ${VERSION}`, '', '📊 Döngü Sayıcıları:'];
   for (const t of TIERS_ORDER) {
     const info = getTierInfo(t);
@@ -477,48 +481,40 @@ async function handleConversationReply(chatId, text) {
   }
 }
 
-async function validateChannel() {
-  if (!CHANNEL_ID) return;
-  try {
-    const me = await bot.getMe();
-    const meId = String(me.id);
-    const chanStr = String(CHANNEL_ID);
-    if (chanStr === meId || chanStr === '@' + me.username) {
-      console.error(`[HATA] TELEGRAM_CHANNEL_ID bota ait ID! Bir kanal veya grup ID'si girin (orn: -1001234567890)`);
-      process.exit(1);
-    }
-    console.log(`[CHANNEL] ${CHANNEL_ID} kullanılıyor`);
-  } catch (e) { console.warn('[CHANNEL validate]', e.message); }
-}
-
 async function main() {
   provider = await getProvider();
   bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
-  await validateChannel();
-
   bot.onText(/\/start/, (msg) => startConversation(msg.chat.id).catch(console.error));
-  bot.onText(/\/sc1/,   (msg) => bot.sendMessage(msg.chat.id, buildTierMsg(1), { parse_mode: 'HTML' }).catch(console.error));
-  bot.onText(/\/sc5/,   (msg) => bot.sendMessage(msg.chat.id, buildTierMsg(2), { parse_mode: 'HTML' }).catch(console.error));
 
-  // /test — sends a test message to CHANNEL_ID to verify the channel is configured correctly
+  bot.onText(/\/track/, async (msg) => {
+    const chatId = msg.chat.id;
+    registeredChats.add(String(chatId));
+    console.log(`[TG] Chat kaydedildi: ${chatId}`);
+    await bot.sendMessage(chatId, `✅ Bu chat bildirim listesine eklendi. Scratch card claim'leri buraya gelecek.`);
+  });
+
+  bot.onText(/\/stop/, async (msg) => {
+    const chatId = String(msg.chat.id);
+    registeredChats.delete(chatId);
+    await bot.sendMessage(msg.chat.id, '🔕 Bu chat bildirim listesinden çıkarıldı.');
+  });
+
   bot.onText(/\/test/, async (msg) => {
     const chatId = msg.chat.id;
-    if (!CHANNEL_ID) {
-      await bot.sendMessage(chatId, '❌ TELEGRAM_CHANNEL_ID ayarlı değil!');
-      return;
-    }
+    registeredChats.add(String(chatId));
     try {
-      await bot.sendMessage(CHANNEL_ID,
-        `✅ <b>Test mesajı</b> ${VERSION}\n📡 Bot çalışıyor, kanal bağlantısı tamam!`,
+      await bot.sendMessage(chatId,
+        `✅ <b>Test mesajı</b> ${VERSION}\n📡 Bot çalışıyor!\n📋 Kayıtlı chat sayısı: ${registeredChats.size}`,
         { parse_mode: 'HTML' }
       );
-      await bot.sendMessage(chatId, `✅ Test mesajı ${CHANNEL_ID} kanalına gönderildi!`);
     } catch (e) {
-      await bot.sendMessage(chatId,
-        `❌ Kanal hatası: ${e.message}\n\nKontrol et:\n• Botu kanala admin olarak ekle\n• CHANNEL_ID doğru mu? (örn: -1001234567890)`);
+      console.error('[TEST]', e.message);
     }
   });
+
+  bot.onText(/\/sc1/, (msg) => bot.sendMessage(msg.chat.id, buildTierMsg(1), { parse_mode: 'HTML' }).catch(console.error));
+  bot.onText(/\/sc5/, (msg) => bot.sendMessage(msg.chat.id, buildTierMsg(2), { parse_mode: 'HTML' }).catch(console.error));
 
   bot.on('message', (msg) => {
     const text = (msg.text || '').trim();
@@ -531,7 +527,7 @@ async function main() {
     if (e.message?.includes('409')) {
       pollingErrCount++;
       if (pollingErrCount === 1)
-        console.error('[TG] 409 Conflict — baska bir instance aktif! Northflank\'ta eski servisi durdur.');
+        console.error('[TG] 409 Conflict — başka bir instance aktif! Eski servisi durdur.');
       if (pollingErrCount > 80) { process.exit(1); }
     } else {
       pollingErrCount = 0;
@@ -540,6 +536,7 @@ async function main() {
   });
 
   console.log(`[${VERSION}] Contract: ${CONTRACT}`);
+  console.log(`[${VERSION}] Kayıtlı chat: ${registeredChats.size} (CHANNEL_ID env: ${CHANNEL_ID || 'yok'})`);
   await loadHistory();
   console.log(`[HISTORY] opal=${ts(1).count}  jade=${ts(2).count}`);
   lastPollBlock = 0;
