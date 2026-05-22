@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v9.17';
+const VERSION = 'v9.18';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -318,19 +318,20 @@ function nftIdFromCalldata(data) {
 }
 
 function collectReceived(receipt, recipient) {
-  // Three-tier collection strategy:
-  //   Tier 1 (CONTRACT): transfer directly from the scratch card contract.
-  //     Most common pattern. If any found, use only these — stops spurious
-  //     protocol-level mints from inflating the total.
-  //   Tier 2 (MINT): Transfer(0x0 -> recipient). Used when the contract
-  //     mints reward tokens directly to the user. Only activated when Tier 1
-  //     finds nothing, preventing the double-count seen with Tier 1 + Tier 2
-  //     mixed (the $0.62 vs $0.41 bug).
-  //   Tier 3 (FALLBACK): any ERC20 to recipient except WETH. Last resort for
-  //     router/swap-routed rewards.
-  const fromContract = {};
-  const fromMint     = {};
-  const fromOther    = {};
+  // Combined collection: both contract-direct transfers (from === CONTRACT)
+  // and mint-to-user events (from === 0x0) count as legitimate scratch card
+  // rewards. Many tiers deliver part of the reward via .transfer() and part
+  // via mint() — taking only one (v9.17) caused under-counting.
+  //
+  // sources[token] tracks where each token's amount came from ('C' = direct
+  // from contract, 'M' = mint to user) so logs / /diag show the breakdown
+  // and pricing oddities are traceable.
+  //
+  // Fallback (fromOther) only activates when neither direct nor mint paths
+  // produced any received tokens — covers router/swap-routed rewards.
+  const received = {};
+  const sources  = {};
+  const fromOther = {};
 
   for (const log of receipt.logs) {
     if (log.topics[0]?.toLowerCase() !== TRANSFER_TOPIC) continue;
@@ -342,22 +343,22 @@ function collectReceived(receipt, recipient) {
     const tokenAddr = log.address.toLowerCase();
     const amt = BigInt(log.data);
     if (fromLog === CONTRACT_LOWER) {
-      fromContract[tokenAddr] = (fromContract[tokenAddr] ?? 0n) + amt;
+      received[tokenAddr] = (received[tokenAddr] ?? 0n) + amt;
+      (sources[tokenAddr] ??= new Set()).add('C');
     } else if (fromLog === ZERO_ADDRESS) {
-      fromMint[tokenAddr] = (fromMint[tokenAddr] ?? 0n) + amt;
+      received[tokenAddr] = (received[tokenAddr] ?? 0n) + amt;
+      (sources[tokenAddr] ??= new Set()).add('M');
     } else if (tokenAddr !== WETH_LOWER) {
       fromOther[tokenAddr] = (fromOther[tokenAddr] ?? 0n) + amt;
     }
   }
 
-  if (Object.keys(fromContract).length)
-    return { received: fromContract, usedFallback: false, src: 'contract' };
-  if (Object.keys(fromMint).length)
-    return { received: fromMint,     usedFallback: false, src: 'mint' };
-  return { received: fromOther, usedFallback: true, src: 'other' };
+  if (Object.keys(received).length)
+    return { received, usedFallback: false, src: 'mixed', sources };
+  return { received: fromOther, usedFallback: true, src: 'other', sources: {} };
 }
 
-async function calcTotalUsd(received) {
+async function calcTotalUsd(received, sources) {
   let totalUsd = 0;
   const tokenSummary = [];
   const tokenDetail  = [];
@@ -375,9 +376,10 @@ async function calcTotalUsd(received) {
         continue;
       }
       const psrc = priceCache[addr.toLowerCase()]?.src || '?';
+      const fsrc = sources && sources[addr] ? Array.from(sources[addr]).sort().join('') : '?';
       totalUsd += usd;
       tokenSummary.push(`${info.symbol}=$${usd.toFixed(4)}`);
-      tokenDetail.push(`${info.symbol} ${human.toFixed(6)} @ $${price.toFixed(8)}[${psrc}] = $${usd.toFixed(4)}`);
+      tokenDetail.push(`${info.symbol}[${fsrc}] ${human.toFixed(6)} @ $${price.toFixed(8)}[${psrc}] = $${usd.toFixed(4)}`);
     } catch (_) {}
   }
   return { totalUsd, tokenSummary, tokenDetail, droppedSummary };
@@ -434,14 +436,14 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
     tier = nftToTier.get(claimedNftId).tier;
   }
 
-  const { received, usedFallback, src } = collectReceived(receipt, claimer);
+  const { received, usedFallback, src, sources } = collectReceived(receipt, claimer);
   if (!Object.keys(received).length) {
     if (!isLoadingHistory || isRecentTx)
       console.log(`[SKIP no-transfer] nft=${claimedNftId} | ${txHash.slice(0,10)}`);
     return;
   }
 
-  const { totalUsd, tokenSummary, tokenDetail, droppedSummary } = await calcTotalUsd(received);
+  const { totalUsd, tokenSummary, tokenDetail, droppedSummary } = await calcTotalUsd(received, sources);
   if (totalUsd <= 0) {
     if (!isLoadingHistory || isRecentTx)
       console.log(`[SKIP no-value] nft=${claimedNftId} dropped=[${droppedSummary.join(' ')}] | ${txHash.slice(0,10)}`);
@@ -542,10 +544,10 @@ async function diagnoseTx(txHash) {
       }
     }
 
-    const { received, usedFallback, src } = collectReceived(receipt, tx.from.toLowerCase());
+    const { received, usedFallback, src, sources } = collectReceived(receipt, tx.from.toLowerCase());
     lines.push(`💸 Recipient transferi: ${Object.keys(received).length} (src=${src})`);
     if (Object.keys(received).length) {
-      const { totalUsd, tokenDetail, droppedSummary } = await calcTotalUsd(received);
+      const { totalUsd, tokenDetail, droppedSummary } = await calcTotalUsd(received, sources);
       for (const t of tokenDetail)    lines.push(`  ✓ ${t}`);
       for (const d of droppedSummary) lines.push(`  ✗ ${d}`);
       lines.push(`💰 Toplam: $${totalUsd.toFixed(4)}`);
