@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v9.26';
+const VERSION = 'v9.27';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -68,6 +68,10 @@ let priceCache = {};
 let ethPrice = 0, ethPriceAt = 0;
 let lastPollBlock = 0;
 let isLoadingHistory = false;
+// v9.27: the NFT itself lives on a separate contract (e.g. 0x154dacde...)
+// while CONTRACT is just the coordinator. Auto-detect from the first
+// mint/burn we see; optionally bootstrap from NFT_CONTRACT env.
+let _nftContractAddr = (process.env.NFT_CONTRACT || '').toLowerCase() || null;
 
 async function getProvider() {
   for (const rpc of RPCS) {
@@ -274,11 +278,33 @@ async function sendNotification(msg) {
   }
 }
 
+// v9.27: detect NFT contract address from any ERC-721 mint or burn event
+// in the receipt, then cache. Called from processTx so subsequent log
+// queries (scanMintLogs / findMintTxOnchain) hit the right address.
+function rememberNftContract(receipt) {
+  if (_nftContractAddr) return;
+  for (const log of receipt.logs) {
+    if (log.topics[0]?.toLowerCase() !== TRANSFER_TOPIC) continue;
+    if (log.topics.length !== 4) continue;
+    const f = ('0x' + log.topics[1].slice(26)).toLowerCase();
+    const t = ('0x' + log.topics[2].slice(26)).toLowerCase();
+    if (f === ZERO_ADDRESS || t === ZERO_ADDRESS) {
+      _nftContractAddr = log.address.toLowerCase();
+      console.log(`[NFT contract] tespit edildi: ${_nftContractAddr}`);
+      return;
+    }
+  }
+}
+
+// v9.27: accept ERC-721 mints from any address — the NFT contract is
+// separate from CONTRACT (the coordinator). If we've already learned the
+// NFT contract, restrict to it so we don't pick up unrelated NFT mints
+// that happen to share the same TX.
 function findNftMint(receipt) {
   for (const log of receipt.logs) {
     if (log.topics[0]?.toLowerCase() !== TRANSFER_TOPIC) continue;
     if (log.topics.length !== 4) continue;
-    if (log.address.toLowerCase() !== CONTRACT_LOWER) continue;
+    if (_nftContractAddr && log.address.toLowerCase() !== _nftContractAddr) continue;
     const f = ('0x' + log.topics[1].slice(26)).toLowerCase();
     if (f !== ZERO_ADDRESS) continue;
     const to = ('0x' + log.topics[2].slice(26)).toLowerCase();
@@ -288,14 +314,12 @@ function findNftMint(receipt) {
   return null;
 }
 
-// v9.22: collect ALL mints in a single BUY TX (a buyer can mint multiple
-// cards in one transaction). Used to compute per-card USDC price correctly.
 function findAllNftMints(receipt) {
   const mints = [];
   for (const log of receipt.logs) {
     if (log.topics[0]?.toLowerCase() !== TRANSFER_TOPIC) continue;
     if (log.topics.length !== 4) continue;
-    if (log.address.toLowerCase() !== CONTRACT_LOWER) continue;
+    if (_nftContractAddr && log.address.toLowerCase() !== _nftContractAddr) continue;
     const f = ('0x' + log.topics[1].slice(26)).toLowerCase();
     if (f !== ZERO_ADDRESS) continue;
     const to = ('0x' + log.topics[2].slice(26)).toLowerCase();
@@ -309,7 +333,7 @@ function findNftBurn(receipt) {
   for (const log of receipt.logs) {
     if (log.topics[0]?.toLowerCase() !== TRANSFER_TOPIC) continue;
     if (log.topics.length !== 4) continue;
-    if (log.address.toLowerCase() !== CONTRACT_LOWER) continue;
+    if (_nftContractAddr && log.address.toLowerCase() !== _nftContractAddr) continue;
     const to = ('0x' + log.topics[2].slice(26)).toLowerCase();
     if (to !== ZERO_ADDRESS) continue;
     const from = ('0x' + log.topics[1].slice(26)).toLowerCase();
@@ -319,18 +343,22 @@ function findNftBurn(receipt) {
   return null;
 }
 
+// v9.27: USDC is paid to a treasury (e.g. 0x553ef3e2...), not to CONTRACT,
+// so don't constrain the recipient — sum every USDC outflow from the payer
+// in this TX. This catches the full price even if it's split across
+// multiple internal transfers.
 function findUsdcPayment(receipt, payer) {
+  let total = 0n;
   for (const log of receipt.logs) {
     if (log.topics[0]?.toLowerCase() !== TRANSFER_TOPIC) continue;
     if (log.topics.length < 3) continue;
     if (log.address.toLowerCase() !== USDC_LOWER) continue;
     const f = ('0x' + log.topics[1].slice(26)).toLowerCase();
-    const t = ('0x' + log.topics[2].slice(26)).toLowerCase();
-    if (f !== payer || t !== CONTRACT_LOWER) continue;
+    if (f !== payer) continue;
     if (!log.data || log.data === '0x') continue;
-    return Number(BigInt(log.data)) / 1e6;
+    total += BigInt(log.data);
   }
-  return 0;
+  return Number(total) / 1e6;
 }
 
 function classifyByUsdc(usdAmount) {
@@ -403,7 +431,7 @@ async function getLogsProvider() {
 // chunked getLogs. Tries Blockscout's logs RPC first (no rate limit but
 // sometimes returns empty for unindexed contracts), then falls back to
 // the main provider with delays between chunks.
-async function _scanLogsForMint(rpcLabel, lp, tokenIdHex, fromZeroTopic, latest, maxLookback, chunk, delayMs) {
+async function _scanLogsForMint(rpcLabel, lp, queryAddr, tokenIdHex, fromZeroTopic, latest, maxLookback, chunk, delayMs) {
   let chunksTried = 0, chunksFailed = 0;
   for (let offset = 0; offset < maxLookback; offset += chunk) {
     const toBlock   = latest - offset;
@@ -412,7 +440,7 @@ async function _scanLogsForMint(rpcLabel, lp, tokenIdHex, fromZeroTopic, latest,
     chunksTried++;
     try {
       const logs = await lp.getLogs({
-        address: CONTRACT,
+        address: queryAddr,
         topics: [TRANSFER_TOPIC, fromZeroTopic, null, tokenIdHex],
         fromBlock, toBlock,
       });
@@ -434,17 +462,21 @@ async function _scanLogsForMint(rpcLabel, lp, tokenIdHex, fromZeroTopic, latest,
 }
 
 async function findMintTxOnchain(nftId) {
+  if (!_nftContractAddr) {
+    console.log(`[mint scan skip] nft=${nftId}: NFT contract bilinmiyor (henüz claim/buy görülmedi)`);
+    return null;
+  }
   const tokenIdHex    = '0x' + BigInt(nftId).toString(16).padStart(64, '0');
   const fromZeroTopic = '0x' + '0'.repeat(64);
+  const queryAddr     = _nftContractAddr;
 
   // Try Blockscout RPC first — wide single chunk (it doesn't rate-limit).
   const lp = await getLogsProvider();
   if (lp) {
     try {
       const latest = await lp.getBlockNumber();
-      // single very-wide chunk first (cheap when supported)
       const logs = await lp.getLogs({
-        address: CONTRACT,
+        address: queryAddr,
         topics: [TRANSFER_TOPIC, fromZeroTopic, null, tokenIdHex],
         fromBlock: Math.max(0, latest - 1_500_000),  // ~35 days on Base
         toBlock: latest,
@@ -459,11 +491,10 @@ async function findMintTxOnchain(nftId) {
     }
   }
 
-  // Fallback: main provider in 9999-block chunks with 200ms delay.
-  // mainnet.base.org caps getLogs at 10k blocks and rate-limits aggressively.
+  // Fallback: main provider in 9999-block chunks with 250ms delay.
   try {
     const latest = await provider.getBlockNumber();
-    return await _scanLogsForMint('mainRPC', provider, tokenIdHex, fromZeroTopic, latest, 200_000, 9999, 250);
+    return await _scanLogsForMint('mainRPC', provider, queryAddr, tokenIdHex, fromZeroTopic, latest, 200_000, 9999, 250);
   } catch (e) {
     console.log(`[mainRPC scan err] nft=${nftId}: ${(e.message || '').slice(0, 80)}`);
   }
@@ -649,6 +680,8 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
       console.log(`[SKIP receipt] status=${receipt?.status ?? 'null'} | ${txHash.slice(0,10)}`);
     return;
   }
+
+  rememberNftContract(receipt);
 
   const claimer = from.toLowerCase();
 
@@ -938,12 +971,14 @@ async function loadHistory() {
     }
   } catch (e) { console.error('[HISTORY tx]', e.message); }
 
-  // (2) v9.25: catch BUYs that went through a router/proxy by scanning the
-  // contract's recent mint events directly. The /transactions endpoint above
-  // only returns TXs whose `to` field is the contract — router-routed
-  // purchases (to=router) emit a mint Transfer event from the contract but
-  // would otherwise be invisible to history loading, leaving nftToTier empty.
-  try {
+  // (2) v9.27: scan the NFT contract for recent mint events to populate
+  // nftToTier for every BUY in the last ~2.3 days, regardless of how the
+  // BUY TX itself was routed. The NFT contract address was learned during
+  // step (1) via rememberNftContract; if no claim/buy was seen yet (e.g.
+  // empty history) we skip the scan.
+  if (!_nftContractAddr) {
+    console.log('[HISTORY] NFT contract henüz öğrenilmedi — mint scan atlanıyor');
+  } else try {
     const lp = await getLogsProvider();
     const useLp = lp || provider;
     const latest = await useLp.getBlockNumber();
@@ -952,13 +987,12 @@ async function loadHistory() {
     let mintLogs = [];
     try {
       mintLogs = await useLp.getLogs({
-        address: CONTRACT,
+        address: _nftContractAddr,
         topics: [TRANSFER_TOPIC, fromZeroTopic],
         fromBlock, toBlock: latest,
       });
     } catch (e) {
       console.log(`[HISTORY mints err] ${(e.message || '').slice(0, 80)} — fallback to chunked main RPC`);
-      // Fallback: chunked scan via main provider
       const CHUNK = 9999;
       for (let off = 0; off < 100_000; off += CHUNK) {
         const to = latest - off;
@@ -966,7 +1000,7 @@ async function loadHistory() {
         if (to < fr) break;
         try {
           const part = await provider.getLogs({
-            address: CONTRACT,
+            address: _nftContractAddr,
             topics: [TRANSFER_TOPIC, fromZeroTopic],
             fromBlock: fr, toBlock: to,
           });
@@ -977,7 +1011,7 @@ async function loadHistory() {
       }
     }
     const uniqueTxs = [...new Set(mintLogs.map(l => l.transactionHash))];
-    console.log(`[HISTORY] ${mintLogs.length} mint log -> ${uniqueTxs.length} eşsiz BUY TX (son ~2.3 gün)`);
+    console.log(`[HISTORY] ${mintLogs.length} mint log -> ${uniqueTxs.length} eşsiz BUY TX (son ~2.3 gün) | NFT contract: ${_nftContractAddr}`);
     for (const hash of uniqueTxs) {
       if (processedTxs.has(hash)) continue;
       try {
@@ -998,18 +1032,19 @@ async function loadHistory() {
   console.log(`[HISTORY] Bitti — green=${g} purple=${p} yüklendi | NFT map=${nftToTier.size} | bildirimler açık`);
 }
 
-// v9.25: scan the contract's mint Transfer events in a block window.
-// scanBlocks only sees TXs with `to=contract`, so router-routed BUYs
-// (to=router, contract called internally) are invisible to it. Mint
-// events are emitted from the contract regardless of caller, so they
-// catch all BUYs.
+// v9.27: scan the NFT contract's mint Transfer events in a block window.
+// CONTRACT is just the coordinator and doesn't emit standard mint events
+// — the actual NFTs live on a separate contract (auto-detected). Without
+// _nftContractAddr known we can't scan (returns []); the address gets
+// learned on the first BUY/CLAIM processed.
 async function scanMintLogs(from, to) {
+  if (!_nftContractAddr) return [];
   try {
     const lp = await getLogsProvider();
     const useLp = lp || provider;
     const fromZeroTopic = '0x' + '0'.repeat(64);
     const logs = await useLp.getLogs({
-      address: CONTRACT,
+      address: _nftContractAddr,
       topics: [TRANSFER_TOPIC, fromZeroTopic],
       fromBlock: from, toBlock: to,
     });
