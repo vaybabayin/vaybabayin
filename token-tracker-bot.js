@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v9.23';
+const VERSION = 'v9.24';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -373,33 +373,46 @@ async function findMintTxBlockscout(nftId) {
   return null;
 }
 
+// v9.24: dedicated provider for log queries — Blockscout's eth-rpc
+// endpoint accepts arbitrary block ranges in a single call with no
+// rate limit on topic-filtered queries. The default `provider` (often
+// mainnet.base.org) caps at 10k blocks and rate-limits chunked scans,
+// which is why v9.22's 100-chunk fallback failed with "over rate limit".
+let _logsProvider = null;
+async function getLogsProvider() {
+  if (_logsProvider) return _logsProvider;
+  try {
+    const p = new ethers.JsonRpcProvider('https://base.blockscout.com/api/eth-rpc');
+    await Promise.race([
+      p.getBlockNumber(),
+      new Promise((_, r) => setTimeout(() => r(new Error('timeout')), 5000)),
+    ]);
+    _logsProvider = p;
+    return p;
+  } catch (_) {
+    return null;
+  }
+}
+
 async function findMintTxOnchain(nftId) {
   try {
-    const tokenIdHex   = '0x' + BigInt(nftId).toString(16).padStart(64, '0');
+    const tokenIdHex    = '0x' + BigInt(nftId).toString(16).padStart(64, '0');
     const fromZeroTopic = '0x' + '0'.repeat(64);
-    const latest = await provider.getBlockNumber();
-    const CHUNK = 9999;             // most public RPCs cap getLogs to 10k blocks
-    const MAX_LOOKBACK = 1_000_000; // ~23 days on Base (2s blocks)
-    for (let offset = 0; offset < MAX_LOOKBACK; offset += CHUNK) {
-      const toBlock   = latest - offset;
-      const fromBlock = Math.max(0, toBlock - CHUNK + 1);
-      if (toBlock < fromBlock) break;
-      try {
-        const logs = await provider.getLogs({
-          address: CONTRACT,
-          topics: [TRANSFER_TOPIC, fromZeroTopic, null, tokenIdHex],
-          fromBlock, toBlock,
-        });
-        if (logs.length) return logs[0].transactionHash;
-      } catch (e) {
-        if (!_getLogsErrLogged) {
-          _getLogsErrLogged = true;
-          console.log(`[getLogs err] first failure: ${(e.message || '').slice(0, 100)} — RPC may not support topic filters or block range`);
-        }
-      }
-      if (fromBlock === 0) break;
+    const lp = await getLogsProvider();
+    if (!lp) return null;
+    const logs = await lp.getLogs({
+      address: CONTRACT,
+      topics: [TRANSFER_TOPIC, fromZeroTopic, null, tokenIdHex],
+      fromBlock: 0,
+      toBlock: 'latest',
+    });
+    if (logs.length) return logs[0].transactionHash;
+  } catch (e) {
+    if (!_getLogsErrLogged) {
+      _getLogsErrLogged = true;
+      console.log(`[getLogs err] ${(e.message || '').slice(0, 100)}`);
     }
-  } catch (_) {}
+  }
   return null;
 }
 
@@ -608,6 +621,14 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
     return;
   }
 
+  // v9.24: check transfers FIRST. The contract receives many non-claim
+  // calls (admin/setX/approve/transfer) where the first uint256 in calldata
+  // is NOT an NFT id. Extracting it as one and logging `[SKIP no-transfer]
+  // nft=3` floods the log with false positives. If the receipt has no
+  // reward transfer to the caller, it is not a claim — drop silently.
+  const { received, usedFallback, src, sources } = collectReceived(receipt, claimer);
+  if (!Object.keys(received).length) return;
+
   let claimedNftId = null;
   const burn = findNftBurn(receipt);
   if (burn) claimedNftId = burn.nftId;
@@ -616,13 +637,6 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
   let tier = null;
   if (claimedNftId && nftToTier.has(claimedNftId)) {
     tier = nftToTier.get(claimedNftId).tier;
-  }
-
-  const { received, usedFallback, src, sources } = collectReceived(receipt, claimer);
-  if (!Object.keys(received).length) {
-    if (!isLoadingHistory || isRecentTx)
-      console.log(`[SKIP no-transfer] nft=${claimedNftId} | ${txHash.slice(0,10)}`);
-    return;
   }
 
   const { totalUsd, tokenSummary, tokenDetail, droppedSummary } = await calcTotalUsd(received, sources);
