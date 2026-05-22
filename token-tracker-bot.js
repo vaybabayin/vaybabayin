@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v9.21';
+const VERSION = 'v9.22';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -288,6 +288,23 @@ function findNftMint(receipt) {
   return null;
 }
 
+// v9.22: collect ALL mints in a single BUY TX (a buyer can mint multiple
+// cards in one transaction). Used to compute per-card USDC price correctly.
+function findAllNftMints(receipt) {
+  const mints = [];
+  for (const log of receipt.logs) {
+    if (log.topics[0]?.toLowerCase() !== TRANSFER_TOPIC) continue;
+    if (log.topics.length !== 4) continue;
+    if (log.address.toLowerCase() !== CONTRACT_LOWER) continue;
+    const f = ('0x' + log.topics[1].slice(26)).toLowerCase();
+    if (f !== ZERO_ADDRESS) continue;
+    const to = ('0x' + log.topics[2].slice(26)).toLowerCase();
+    const nftId = BigInt(log.topics[3]).toString();
+    mints.push({ nftId, to });
+  }
+  return mints;
+}
+
 function findNftBurn(receipt) {
   for (const log of receipt.logs) {
     if (log.topics[0]?.toLowerCase() !== TRANSFER_TOPIC) continue;
@@ -322,31 +339,103 @@ function classifyByUsdc(usdAmount) {
   return null;
 }
 
-// v9.21: recover NFT → tier mapping from the chain when not in memory
-// (e.g. after a bot restart, or when the BUY happened outside the history
-// window). Pulls the original mint event from Blockscout, reads the USDC
-// payment from that BUY TX's receipt, and classifies the tier.
-async function recoverTierFromBuyTx(nftId) {
+// v9.22: find the mint TX hash for an NFT — Blockscout first (fast),
+// eth_getLogs fallback (slower but works when Blockscout doesn't index
+// the token or the mint is outside the default page).
+async function findMintTxBlockscout(nftId) {
+  const addr = CONTRACT.toLowerCase();
+  // Try the per-instance transfers endpoint
   try {
-    const url = `https://base.blockscout.com/api/v2/tokens/${CONTRACT}/instances/${nftId}/transfers`;
+    const url = `https://base.blockscout.com/api/v2/tokens/${addr}/instances/${nftId}/transfers`;
     const r = await axios.get(url, { timeout: 10000 });
     const items = r.data?.items || [];
-    const mintItem = items.find(t => (t.from?.hash || '').toLowerCase() === ZERO_ADDRESS);
-    if (!mintItem) return null;
-    const buyTxHash = mintItem.transaction_hash || mintItem.tx_hash;
-    if (!buyTxHash) return null;
+    for (const t of items) {
+      const fromHash = (t.from?.hash || t.from || '').toLowerCase();
+      if (fromHash === ZERO_ADDRESS) {
+        return t.transaction_hash || t.tx_hash || t.hash || null;
+      }
+    }
+  } catch (e) {
+    console.log(`[BS instances] nft=${nftId}: ${(e.message || '').slice(0, 60)}`);
+  }
+  return null;
+}
+
+async function findMintTxOnchain(nftId) {
+  try {
+    const tokenIdHex   = '0x' + BigInt(nftId).toString(16).padStart(64, '0');
+    const fromZeroTopic = '0x' + '0'.repeat(64);
+    const latest = await provider.getBlockNumber();
+    const CHUNK = 9999;             // most public RPCs cap getLogs to 10k blocks
+    const MAX_LOOKBACK = 1_000_000; // ~23 days on Base (2s blocks)
+    for (let offset = 0; offset < MAX_LOOKBACK; offset += CHUNK) {
+      const toBlock   = latest - offset;
+      const fromBlock = Math.max(0, toBlock - CHUNK + 1);
+      if (toBlock < fromBlock) break;
+      try {
+        const logs = await provider.getLogs({
+          address: CONTRACT,
+          topics: [TRANSFER_TOPIC, fromZeroTopic, null, tokenIdHex],
+          fromBlock, toBlock,
+        });
+        if (logs.length) return logs[0].transactionHash;
+      } catch (_) { /* chunk failed — try next */ }
+      if (fromBlock === 0) break;
+    }
+  } catch (_) {}
+  return null;
+}
+
+async function findMintTxHash(nftId) {
+  const fromBs = await findMintTxBlockscout(nftId);
+  if (fromBs) return { hash: fromBs, src: 'blockscout' };
+  const fromRpc = await findMintTxOnchain(nftId);
+  if (fromRpc) return { hash: fromRpc, src: 'getLogs' };
+  return null;
+}
+
+// v9.22: recover NFT → tier mapping from the chain when not in memory
+// (e.g. after a bot restart, or when the BUY happened outside the history
+// window). Handles multi-mint TXs: when a buyer mints N cards in one BUY,
+// per-card price = totalUsdcPaid / N (so 5×$1 doesn't get misclassified
+// as $5 = purple). Registers ALL minted NFTs from that BUY TX, not just
+// the one being recovered — future claims for siblings will hit the map.
+async function recoverTierFromBuyTx(nftId) {
+  try {
+    const found = await findMintTxHash(nftId);
+    if (!found) {
+      console.log(`[RECOVER fail] nft=${nftId}: mint TX not found via Blockscout or RPC`);
+      return null;
+    }
+    const { hash: buyTxHash, src: lookupSrc } = found;
 
     const buyReceipt = await provider.getTransactionReceipt(buyTxHash);
-    if (!buyReceipt) return null;
-    const mint = findNftMint(buyReceipt);
-    if (!mint) return null;
+    if (!buyReceipt) {
+      console.log(`[RECOVER fail] nft=${nftId}: no receipt for ${buyTxHash.slice(0,10)}`);
+      return null;
+    }
 
-    const usdPaid = findUsdcPayment(buyReceipt, mint.to);
-    const tier    = classifyByUsdc(usdPaid);
+    const allMints = findAllNftMints(buyReceipt);
+    if (!allMints.length) {
+      console.log(`[RECOVER fail] nft=${nftId}: no mints in ${buyTxHash.slice(0,10)}`);
+      return null;
+    }
+
+    const mintForThis = allMints.find(m => m.nftId === String(nftId)) || allMints[0];
+    const usdPaid     = findUsdcPayment(buyReceipt, mintForThis.to);
+    const perCard     = usdPaid / allMints.length;
+    const tier        = classifyByUsdc(perCard);
+
     if (tier) {
-      const buyTs = Math.floor(new Date(mintItem.timestamp).getTime() / 1000) || 0;
-      nftToTier.set(nftId, { tier, buyer: mint.to, buyTxHash, buyTs });
-      console.log(`[RECOVER] nft=${nftId} tier=${tier} (${TIER_INFO[tier].name}) paid=$${usdPaid.toFixed(2)} from ${buyTxHash.slice(0,10)}`);
+      const block = await provider.getBlock(buyReceipt.blockNumber).catch(() => null);
+      const buyTs = block?.timestamp || 0;
+      // Register every minted NFT in this BUY TX so sibling claims also hit.
+      for (const m of allMints) {
+        nftToTier.set(m.nftId, { tier, buyer: m.to, buyTxHash, buyTs });
+      }
+      console.log(`[RECOVER ${lookupSrc}] nft=${nftId} tier=${tier} (${TIER_INFO[tier].name}) totalPaid=$${usdPaid.toFixed(2)} mints=${allMints.length} perCard=$${perCard.toFixed(2)} from ${buyTxHash.slice(0,10)}`);
+    } else {
+      console.log(`[RECOVER no-tier ${lookupSrc}] nft=${nftId}: found BUY ${buyTxHash.slice(0,10)} but perCard=$${perCard.toFixed(2)} (totalPaid=$${usdPaid.toFixed(2)} mints=${allMints.length}) — not $1 / $5`);
     }
     return tier;
   } catch (e) {
@@ -479,17 +568,25 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
 
   const claimer = from.toLowerCase();
 
-  const mint = findNftMint(receipt);
-  if (mint) {
-    const usdPaid = findUsdcPayment(receipt, mint.to);
-    const tier = classifyByUsdc(usdPaid);
+  // v9.22: support multi-mint BUY TXs (buyer mints N cards in one TX).
+  // Per-card price = totalUsdcPaid / N. Without this, 5×$1 cards would be
+  // misclassified as a single $5 purple, and siblings of the first NFT would
+  // never get a tier mapping (only the first mint was registered before).
+  const allMints = findAllNftMints(receipt);
+  if (allMints.length) {
+    const firstMint = allMints[0];
+    const usdPaid   = findUsdcPayment(receipt, firstMint.to);
+    const perCard   = usdPaid / allMints.length;
+    const tier      = classifyByUsdc(perCard);
     if (tier) {
-      nftToTier.set(mint.nftId, { tier, buyer: mint.to, buyTxHash: txHash, buyTs: blockTs });
+      for (const m of allMints) {
+        nftToTier.set(m.nftId, { tier, buyer: m.to, buyTxHash: txHash, buyTs: blockTs });
+      }
       if (!isLoadingHistory || isRecentTx)
-        console.log(`[BUY] nft=${mint.nftId} tier=${tier} (${TIER_INFO[tier].name}) paid=$${usdPaid.toFixed(2)} buyer=${mint.to.slice(0,10)} | ${txHash.slice(0,10)}`);
+        console.log(`[BUY] mints=${allMints.length} tier=${tier} (${TIER_INFO[tier].name}) totalPaid=$${usdPaid.toFixed(2)} perCard=$${perCard.toFixed(2)} buyer=${firstMint.to.slice(0,10)} ids=[${allMints.map(m=>m.nftId).join(',')}] | ${txHash.slice(0,10)}`);
     } else {
       if (!isLoadingHistory || isRecentTx)
-        console.log(`[BUY ?] nft=${mint.nftId} paid=$${usdPaid.toFixed(2)} (tier yok) | ${txHash.slice(0,10)}`);
+        console.log(`[BUY ?] mints=${allMints.length} totalPaid=$${usdPaid.toFixed(2)} perCard=$${perCard.toFixed(2)} (tier yok) | ${txHash.slice(0,10)}`);
     }
     return;
   }
@@ -594,9 +691,12 @@ async function diagnoseTx(txHash) {
     const mint = findNftMint(receipt);
     const burn = findNftBurn(receipt);
     if (mint) {
+      const all = findAllNftMints(receipt);
       const paid = findUsdcPayment(receipt, mint.to);
-      const tier = classifyByUsdc(paid);
-      lines.push(`🛒 BUY TX: NFT #${mint.nftId} mint → ${mint.to.slice(0,12)} | USDC ödeme: $${paid.toFixed(2)} → tier=${tier ?? '?'}`);
+      const perCard = paid / (all.length || 1);
+      const tier = classifyByUsdc(perCard);
+      lines.push(`🛒 BUY TX: ${all.length} mint, totalPaid=$${paid.toFixed(2)}, perCard=$${perCard.toFixed(2)} → tier=${tier ?? '?'}`);
+      lines.push(`   NFT id'ler: [${all.map(m => '#'+m.nftId).join(', ')}] → ${mint.to.slice(0,12)}`);
       if (nftToTier.has(mint.nftId)) lines.push(`  ✓ Map'te: ${JSON.stringify(nftToTier.get(mint.nftId)).slice(0,100)}`);
     } else if (burn) {
       lines.push(`🔥 CLAIM TX: NFT #${burn.nftId} burn from ${burn.from.slice(0,12)}`);
