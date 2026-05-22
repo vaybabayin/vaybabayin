@@ -3,12 +3,13 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v9.16';
+const VERSION = 'v9.17';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
 const SC1_TARGET    = parseInt(process.env.SC1_TARGET || '200');
 const SC5_TARGET    = parseInt(process.env.SC5_TARGET || '100');
+const COINGECKO_KEY = process.env.COINGECKO_API_KEY || '';
 
 if (!TELEGRAM_TOKEN) { console.error('TELEGRAM_BOT_TOKEN eksik!'); process.exit(1); }
 
@@ -111,14 +112,52 @@ async function getTokenInfo(address) {
   return tokenInfoCache[k];
 }
 
-async function getTokenPriceUsd(address) {
+// CoinGecko Simple Price API on Base. Returns null on miss/error.
+// Pro key (CG-...) auto-selects pro-api.coingecko.com.
+async function cgPrice(address) {
+  const isPro = COINGECKO_KEY && COINGECKO_KEY.startsWith('CG-');
+  const host  = isPro ? 'https://pro-api.coingecko.com' : 'https://api.coingecko.com';
+  const url   = `${host}/api/v3/simple/token_price/base`;
+  const params = { contract_addresses: address, vs_currencies: 'usd' };
+  const headers = {};
+  if (COINGECKO_KEY) {
+    if (isPro) headers['x-cg-pro-api-key'] = COINGECKO_KEY;
+    else       headers['x-cg-demo-api-key'] = COINGECKO_KEY;
+  }
+  try {
+    const r = await axios.get(url, { params, headers, timeout: 6000 });
+    const obj = r.data?.[address.toLowerCase()];
+    const p = obj?.usd;
+    return typeof p === 'number' && p > 0 && p < 1e9 ? p : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// DexScreener — pick highest-USD-liquidity Base pair (not just pairs[0]).
+async function dsPrice(address) {
+  try {
+    const r = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${address}`, { timeout: 8000 });
+    const pairs = (r.data?.pairs || [])
+      .filter(p => p.chainId === 'base')
+      .filter(p => p.priceUsd && parseFloat(p.priceUsd) > 0)
+      .map(p => ({ price: parseFloat(p.priceUsd), liq: Number(p.liquidity?.usd) || 0 }))
+      .sort((a, b) => b.liq - a.liq);
+    if (!pairs.length) return null;
+    return pairs[0].price;
+  } catch (_) {
+    return null;
+  }
+}
+
+// Uniswap V3 on Base — try every fee tier on USDC and WETH, pick the pool
+// with the highest in-range liquidity (instead of "first found wins").
+async function uniPrice(address, decimals) {
   const k = address.toLowerCase();
-  const cached = priceCache[k];
-  if (cached && Date.now() - cached.at < 60_000) return cached.price;
-  const { decimals } = await getTokenInfo(address);
   const uniFactory = new ethers.Contract(UNI_FACTORY,
     ['function getPool(address,address,uint24) view returns (address)'], provider);
-  for (const [quote, qDec, isEth] of [[WETH, 18, true], [USDC, 6, false]]) {
+  let best = { price: 0, liq: 0n };
+  for (const [quote, qDec, isEth] of [[USDC, 6, false], [WETH, 18, true]]) {
     for (const fee of [100, 500, 3000, 10000]) {
       try {
         const pa = await uniFactory.getPool(address, quote, fee);
@@ -126,20 +165,29 @@ async function getTokenPriceUsd(address) {
         const pool = new ethers.Contract(pa, [
           'function slot0() view returns (uint160,int24,uint16,uint16,uint16,uint8,bool)',
           'function token0() view returns (address)',
+          'function liquidity() view returns (uint128)',
         ], provider);
-        const [s, t0] = await Promise.all([pool.slot0(), pool.token0()]);
+        const [s, t0, liq] = await Promise.all([pool.slot0(), pool.token0(), pool.liquidity()]);
         const isT0 = t0.toLowerCase() === k;
         const sq = Number(s[0]) / 2 ** 96, pr = sq * sq;
         const piq = isT0 ? pr*(10**qDec)/(10**decimals) : (1/pr)*(10**decimals)/(10**qDec);
         const pusd = isEth ? piq * await getEthUsd() : piq;
-        if (pusd > 0 && pusd < 1e12) { priceCache[k] = { price: pusd, at: Date.now() }; return pusd; }
+        if (!(pusd > 0 && pusd < 1e9)) continue;
+        if (BigInt(liq) > best.liq) best = { price: pusd, liq: BigInt(liq) };
       } catch (_) {}
     }
   }
+  return best.price > 0 ? best.price : null;
+}
+
+// Aerodrome V2 — pick deepest pool by reserves * price.
+async function aeroPrice(address, decimals) {
+  const k = address.toLowerCase();
   try {
     const af = new ethers.Contract(AERO_FACTORY,
       ['function getPair(address,address,bool) view returns (address)'], provider);
-    for (const [quote, qDec, isEth] of [[WETH, 18, true], [USDC, 6, false]]) {
+    let best = { price: 0, depth: 0 };
+    for (const [quote, qDec, isEth] of [[USDC, 6, false], [WETH, 18, true]]) {
       for (const stable of [false, true]) {
         try {
           const pa = await af.getPair(address, quote, stable);
@@ -153,20 +201,40 @@ async function getTokenPriceUsd(address) {
           const tokR = Number(ethers.formatUnits(isT0 ? res[0] : res[1], decimals));
           const quoR = Number(ethers.formatUnits(isT0 ? res[1] : res[0], qDec));
           if (tokR <= 0 || quoR <= 0) continue;
-          const pusd = isEth ? (quoR/tokR)*await getEthUsd() : quoR/tokR;
-          if (pusd > 0 && pusd < 1e12) { priceCache[k] = { price: pusd, at: Date.now() }; return pusd; }
+          const pusd  = isEth ? (quoR/tokR)*await getEthUsd() : quoR/tokR;
+          const depth = isEth ? quoR * await getEthUsd() : quoR;
+          if (!(pusd > 0 && pusd < 1e9)) continue;
+          if (depth > best.depth) best = { price: pusd, depth };
         } catch (_) {}
       }
     }
-  } catch (_) {}
-  try {
-    const r = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${address}`, { timeout: 8000 });
-    const pairs = (r.data?.pairs || []).filter(p => p.chainId === 'base');
-    if (pairs.length) {
-      const price = parseFloat(pairs[0].priceUsd);
-      if (price > 0) { priceCache[k] = { price, at: Date.now() }; return price; }
-    }
-  } catch (_) {}
+    return best.price > 0 ? best.price : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function getTokenPriceUsd(address) {
+  const k = address.toLowerCase();
+  const cached = priceCache[k];
+  if (cached && Date.now() - cached.at < 60_000) return cached.price;
+  const { decimals } = await getTokenInfo(address);
+
+  // Source order (most reliable first):
+  //   1. CoinGecko Simple Price (curated, deep-liquidity reference price)
+  //   2. DexScreener best-liquidity Base pair (aggregator, USD-quoted)
+  //   3. Uniswap V3 on-chain — pick deepest pool across all fee tiers
+  //   4. Aerodrome V2 on-chain — pick deepest pool
+  let price = null, src = null;
+  price = await cgPrice(address);                          if (price) src = 'cg';
+  if (!price) { price = await dsPrice(address);            if (price) src = 'ds'; }
+  if (!price) { price = await uniPrice(address, decimals); if (price) src = 'uni'; }
+  if (!price) { price = await aeroPrice(address, decimals); if (price) src = 'aero'; }
+
+  if (price) {
+    priceCache[k] = { price, at: Date.now(), src };
+    return price;
+  }
   return null;
 }
 
@@ -306,9 +374,10 @@ async function calcTotalUsd(received) {
         droppedSummary.push(`${info.symbol}=$${usd.toFixed(2)}(OUTLIER)`);
         continue;
       }
+      const psrc = priceCache[addr.toLowerCase()]?.src || '?';
       totalUsd += usd;
       tokenSummary.push(`${info.symbol}=$${usd.toFixed(4)}`);
-      tokenDetail.push(`${info.symbol} ${human.toFixed(6)} @ $${price.toFixed(8)} = $${usd.toFixed(4)}`);
+      tokenDetail.push(`${info.symbol} ${human.toFixed(6)} @ $${price.toFixed(8)}[${psrc}] = $${usd.toFixed(4)}`);
     } catch (_) {}
   }
   return { totalUsd, tokenSummary, tokenDetail, droppedSummary };
@@ -732,7 +801,7 @@ async function main() {
 
   console.log(`[${VERSION}] Contract: ${CONTRACT}`);
   console.log(`[${VERSION}] green=$1 döngü=${SC1_TARGET} | purple=$5 döngü=${SC5_TARGET}`);
-  console.log(`[${VERSION}] BOT_START_TS=${BOT_START_TS} LIVE_WINDOW_SEC=${LIVE_WINDOW_SEC}`);
+  console.log(`[${VERSION}] BOT_START_TS=${BOT_START_TS} LIVE_WINDOW_SEC=${LIVE_WINDOW_SEC} CG_KEY=${COINGECKO_KEY ? 'yes' : 'no'}`);
   await loadHistory();
   console.log(`[HISTORY] NFT map=${nftToTier.size} | green count=${ts(1).count} sessionCount=${ts(1).sessionCount}/${SC1_TARGET}  purple count=${ts(2).count} sessionCount=${ts(2).sessionCount}/${SC5_TARGET}`);
   lastPollBlock = 0;
