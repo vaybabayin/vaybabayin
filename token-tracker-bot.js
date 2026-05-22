@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v9.18';
+const VERSION = 'v9.20';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -114,6 +114,9 @@ async function getTokenInfo(address) {
 
 // CoinGecko Simple Price API on Base. Returns null on miss/error.
 // Pro key (CG-...) auto-selects pro-api.coingecko.com.
+// v9.20: always retry once after 1.5s when the first attempt returns null.
+// Covers both 429 rate-limits AND the empty-200 bodies CoinGecko sometimes
+// returns when polled too quickly.
 async function cgPrice(address) {
   const isPro = COINGECKO_KEY && COINGECKO_KEY.startsWith('CG-');
   const host  = isPro ? 'https://pro-api.coingecko.com' : 'https://api.coingecko.com';
@@ -124,14 +127,22 @@ async function cgPrice(address) {
     if (isPro) headers['x-cg-pro-api-key'] = COINGECKO_KEY;
     else       headers['x-cg-demo-api-key'] = COINGECKO_KEY;
   }
-  try {
-    const r = await axios.get(url, { params, headers, timeout: 6000 });
-    const obj = r.data?.[address.toLowerCase()];
-    const p = obj?.usd;
-    return typeof p === 'number' && p > 0 && p < 1e9 ? p : null;
-  } catch (_) {
-    return null;
-  }
+
+  const fetchOnce = async () => {
+    try {
+      const r = await axios.get(url, { params, headers, timeout: 6000 });
+      const obj = r.data?.[address.toLowerCase()];
+      const p = obj?.usd;
+      return typeof p === 'number' && p > 0 && p < 1e9 ? p : null;
+    } catch (_) {
+      return null;
+    }
+  };
+
+  const first = await fetchOnce();
+  if (first) return first;
+  await new Promise(r => setTimeout(r, 1500));
+  return await fetchOnce();
 }
 
 // DexScreener — pick highest-USD-liquidity Base pair (not just pairs[0]).
@@ -363,25 +374,49 @@ async function calcTotalUsd(received, sources) {
   const tokenSummary = [];
   const tokenDetail  = [];
   const droppedSummary = [];
+
+  const addPriced = (addr, info, human, price, label) => {
+    const usd = human * price;
+    if (usd < 0.0001) return;
+    if (usd > PER_TOKEN_MAX_USD) {
+      droppedSummary.push(`${info.symbol}=$${usd.toFixed(2)}(OUTLIER)`);
+      return;
+    }
+    const psrc = priceCache[addr.toLowerCase()]?.src || '?';
+    const fsrc = sources && sources[addr] ? Array.from(sources[addr]).sort().join('') : '?';
+    totalUsd += usd;
+    tokenSummary.push(`${info.symbol}=$${usd.toFixed(4)}`);
+    tokenDetail.push(`${info.symbol}[${fsrc}] ${human.toFixed(6)} @ $${price.toFixed(8)}[${psrc}${label}] = $${usd.toFixed(4)}`);
+  };
+
+  const pending = []; // tokens that returned NO_PRICE on the first pass
+
   for (const [addr, rawAmt] of Object.entries(received)) {
     try {
       const info  = await getTokenInfo(addr);
       const human = Number(ethers.formatUnits(rawAmt, info.decimals));
       const price = await getTokenPriceUsd(addr);
-      if (!price) { droppedSummary.push(`${info.symbol}=NO_PRICE`); continue; }
-      const usd = human * price;
-      if (usd < 0.0001) continue;
-      if (usd > PER_TOKEN_MAX_USD) {
-        droppedSummary.push(`${info.symbol}=$${usd.toFixed(2)}(OUTLIER)`);
-        continue;
-      }
-      const psrc = priceCache[addr.toLowerCase()]?.src || '?';
-      const fsrc = sources && sources[addr] ? Array.from(sources[addr]).sort().join('') : '?';
-      totalUsd += usd;
-      tokenSummary.push(`${info.symbol}=$${usd.toFixed(4)}`);
-      tokenDetail.push(`${info.symbol}[${fsrc}] ${human.toFixed(6)} @ $${price.toFixed(8)}[${psrc}] = $${usd.toFixed(4)}`);
+      if (!price) { pending.push({ addr, info, human }); continue; }
+      addPriced(addr, info, human, price, '');
     } catch (_) {}
   }
+
+  // v9.20: second pass — retry every NO_PRICE token after a brief delay and
+  // a cache bust. CoinGecko/DexScreener occasionally return empty/429 right
+  // at claim time and recover seconds later; without this, the Telegram total
+  // under-counts (e.g. $0.75) versus what /diag reports a minute later ($1.00).
+  if (pending.length) {
+    await new Promise(r => setTimeout(r, 2000));
+    for (const { addr, info, human } of pending) {
+      try {
+        delete priceCache[addr.toLowerCase()];
+        const price = await getTokenPriceUsd(addr);
+        if (!price) { droppedSummary.push(`${info.symbol}=NO_PRICE`); continue; }
+        addPriced(addr, info, human, price, '*retry');
+      } catch (_) {}
+    }
+  }
+
   return { totalUsd, tokenSummary, tokenDetail, droppedSummary };
 }
 
