@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v9.24';
+const VERSION = 'v9.25';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -374,13 +374,16 @@ async function findMintTxBlockscout(nftId) {
 }
 
 // v9.24: dedicated provider for log queries — Blockscout's eth-rpc
-// endpoint accepts arbitrary block ranges in a single call with no
-// rate limit on topic-filtered queries. The default `provider` (often
-// mainnet.base.org) caps at 10k blocks and rate-limits chunked scans,
-// which is why v9.22's 100-chunk fallback failed with "over rate limit".
-let _logsProvider = null;
+// endpoint, used as primary because it doesn't rate-limit topic-filtered
+// queries the way mainnet.base.org does. v9.25 also keeps a fallback
+// against the main provider with smaller chunks, since Blockscout's RPC
+// sometimes returns empty for contracts it hasn't indexed as a token.
+let _logsProvider     = null;
+let _logsProviderTried = false;
 async function getLogsProvider() {
   if (_logsProvider) return _logsProvider;
+  if (_logsProviderTried) return null;
+  _logsProviderTried = true;
   try {
     const p = new ethers.JsonRpcProvider('https://base.blockscout.com/api/eth-rpc');
     await Promise.race([
@@ -388,30 +391,81 @@ async function getLogsProvider() {
       new Promise((_, r) => setTimeout(() => r(new Error('timeout')), 5000)),
     ]);
     _logsProvider = p;
+    console.log('[logsRPC ✓] base.blockscout.com/api/eth-rpc');
     return p;
-  } catch (_) {
+  } catch (e) {
+    console.log(`[logsRPC ✗] ${(e.message || '').slice(0, 80)}`);
     return null;
   }
 }
 
-async function findMintTxOnchain(nftId) {
-  try {
-    const tokenIdHex    = '0x' + BigInt(nftId).toString(16).padStart(64, '0');
-    const fromZeroTopic = '0x' + '0'.repeat(64);
-    const lp = await getLogsProvider();
-    if (!lp) return null;
-    const logs = await lp.getLogs({
-      address: CONTRACT,
-      topics: [TRANSFER_TOPIC, fromZeroTopic, null, tokenIdHex],
-      fromBlock: 0,
-      toBlock: 'latest',
-    });
-    if (logs.length) return logs[0].transactionHash;
-  } catch (e) {
-    if (!_getLogsErrLogged) {
-      _getLogsErrLogged = true;
-      console.log(`[getLogs err] ${(e.message || '').slice(0, 100)}`);
+// v9.25: scan a bounded window backwards from the most recent block via
+// chunked getLogs. Tries Blockscout's logs RPC first (no rate limit but
+// sometimes returns empty for unindexed contracts), then falls back to
+// the main provider with delays between chunks.
+async function _scanLogsForMint(rpcLabel, lp, tokenIdHex, fromZeroTopic, latest, maxLookback, chunk, delayMs) {
+  let chunksTried = 0, chunksFailed = 0;
+  for (let offset = 0; offset < maxLookback; offset += chunk) {
+    const toBlock   = latest - offset;
+    const fromBlock = Math.max(0, toBlock - chunk + 1);
+    if (toBlock < fromBlock) break;
+    chunksTried++;
+    try {
+      const logs = await lp.getLogs({
+        address: CONTRACT,
+        topics: [TRANSFER_TOPIC, fromZeroTopic, null, tokenIdHex],
+        fromBlock, toBlock,
+      });
+      if (logs.length) {
+        console.log(`[${rpcLabel} hit] mint @ block=${logs[0].blockNumber} after ${chunksTried} chunks`);
+        return logs[0].transactionHash;
+      }
+    } catch (e) {
+      chunksFailed++;
+      if (chunksFailed === 1) {
+        console.log(`[${rpcLabel} err] first chunk failed: ${(e.message || '').slice(0, 80)}`);
+      }
     }
+    if (fromBlock === 0) break;
+    if (delayMs) await new Promise(r => setTimeout(r, delayMs));
+  }
+  console.log(`[${rpcLabel} miss] no mint event in ${chunksTried} chunks (failed=${chunksFailed})`);
+  return null;
+}
+
+async function findMintTxOnchain(nftId) {
+  const tokenIdHex    = '0x' + BigInt(nftId).toString(16).padStart(64, '0');
+  const fromZeroTopic = '0x' + '0'.repeat(64);
+
+  // Try Blockscout RPC first — wide single chunk (it doesn't rate-limit).
+  const lp = await getLogsProvider();
+  if (lp) {
+    try {
+      const latest = await lp.getBlockNumber();
+      // single very-wide chunk first (cheap when supported)
+      const logs = await lp.getLogs({
+        address: CONTRACT,
+        topics: [TRANSFER_TOPIC, fromZeroTopic, null, tokenIdHex],
+        fromBlock: Math.max(0, latest - 1_500_000),  // ~35 days on Base
+        toBlock: latest,
+      });
+      if (logs.length) {
+        console.log(`[blockscoutRPC hit] nft=${nftId} mint @ block=${logs[0].blockNumber}`);
+        return logs[0].transactionHash;
+      }
+      console.log(`[blockscoutRPC miss] nft=${nftId} wide scan returned 0 logs — falling back to main RPC`);
+    } catch (e) {
+      console.log(`[blockscoutRPC err] nft=${nftId}: ${(e.message || '').slice(0, 80)} — falling back to main RPC`);
+    }
+  }
+
+  // Fallback: main provider in 9999-block chunks with 200ms delay.
+  // mainnet.base.org caps getLogs at 10k blocks and rate-limits aggressively.
+  try {
+    const latest = await provider.getBlockNumber();
+    return await _scanLogsForMint('mainRPC', provider, tokenIdHex, fromZeroTopic, latest, 200_000, 9999, 250);
+  } catch (e) {
+    console.log(`[mainRPC scan err] nft=${nftId}: ${(e.message || '').slice(0, 80)}`);
   }
   return null;
 }
@@ -831,13 +885,15 @@ async function loadHistory() {
   isLoadingHistory = true;
   console.log('[HISTORY] Blockscout API... (eski TX\'ler silent, son 5dk bildirimler açık)');
   const countBefore = { 1: ts(1).count, 2: ts(2).count };
+
+  // (1) Direct-to-contract TXs — claims and direct BUYs.
   try {
     const r = await axios.get(
       `https://base.blockscout.com/api/v2/addresses/${CONTRACT}/transactions`,
       { params: { filter: 'to' }, timeout: 15000 }
     );
     const items = r.data?.items || [];
-    console.log(`[HISTORY] ${items.length} TX alındı, işleniyor...`);
+    console.log(`[HISTORY] ${items.length} direkt TX alındı, işleniyor...`);
     const txs = items
       .filter(tx => tx.status === 'ok')
       .sort((a, b) => a.block - b.block);
@@ -849,11 +905,87 @@ async function loadHistory() {
         await processTx(tx.hash, fromAddr, tx.raw_input || '', tx.block, blockTs);
       } catch (_) {}
     }
-  } catch (e) { console.error('[HISTORY]', e.message); }
+  } catch (e) { console.error('[HISTORY tx]', e.message); }
+
+  // (2) v9.25: catch BUYs that went through a router/proxy by scanning the
+  // contract's recent mint events directly. The /transactions endpoint above
+  // only returns TXs whose `to` field is the contract — router-routed
+  // purchases (to=router) emit a mint Transfer event from the contract but
+  // would otherwise be invisible to history loading, leaving nftToTier empty.
+  try {
+    const lp = await getLogsProvider();
+    const useLp = lp || provider;
+    const latest = await useLp.getBlockNumber();
+    const fromZeroTopic = '0x' + '0'.repeat(64);
+    const fromBlock = Math.max(0, latest - 100_000);  // ~2.3 days on Base
+    let mintLogs = [];
+    try {
+      mintLogs = await useLp.getLogs({
+        address: CONTRACT,
+        topics: [TRANSFER_TOPIC, fromZeroTopic],
+        fromBlock, toBlock: latest,
+      });
+    } catch (e) {
+      console.log(`[HISTORY mints err] ${(e.message || '').slice(0, 80)} — fallback to chunked main RPC`);
+      // Fallback: chunked scan via main provider
+      const CHUNK = 9999;
+      for (let off = 0; off < 100_000; off += CHUNK) {
+        const to = latest - off;
+        const fr = Math.max(0, to - CHUNK + 1);
+        if (to < fr) break;
+        try {
+          const part = await provider.getLogs({
+            address: CONTRACT,
+            topics: [TRANSFER_TOPIC, fromZeroTopic],
+            fromBlock: fr, toBlock: to,
+          });
+          mintLogs = mintLogs.concat(part);
+        } catch (_) {}
+        if (fr === 0) break;
+        await new Promise(r => setTimeout(r, 250));
+      }
+    }
+    const uniqueTxs = [...new Set(mintLogs.map(l => l.transactionHash))];
+    console.log(`[HISTORY] ${mintLogs.length} mint log -> ${uniqueTxs.length} eşsiz BUY TX (son ~2.3 gün)`);
+    for (const hash of uniqueTxs) {
+      if (processedTxs.has(hash)) continue;
+      try {
+        const [tx, receipt] = await Promise.all([
+          provider.getTransaction(hash).catch(() => null),
+          provider.getTransactionReceipt(hash).catch(() => null),
+        ]);
+        if (!tx || !receipt) continue;
+        const block = await provider.getBlock(receipt.blockNumber).catch(() => null);
+        await processTx(hash, tx.from, tx.data || '', receipt.blockNumber, block?.timestamp || 0);
+      } catch (_) {}
+    }
+  } catch (e) { console.error('[HISTORY mints]', e.message); }
+
   isLoadingHistory = false;
   const g = ts(1).count - countBefore[1];
   const p = ts(2).count - countBefore[2];
   console.log(`[HISTORY] Bitti — green=${g} purple=${p} yüklendi | NFT map=${nftToTier.size} | bildirimler açık`);
+}
+
+// v9.25: scan the contract's mint Transfer events in a block window.
+// scanBlocks only sees TXs with `to=contract`, so router-routed BUYs
+// (to=router, contract called internally) are invisible to it. Mint
+// events are emitted from the contract regardless of caller, so they
+// catch all BUYs.
+async function scanMintLogs(from, to) {
+  try {
+    const lp = await getLogsProvider();
+    const useLp = lp || provider;
+    const fromZeroTopic = '0x' + '0'.repeat(64);
+    const logs = await useLp.getLogs({
+      address: CONTRACT,
+      topics: [TRANSFER_TOPIC, fromZeroTopic],
+      fromBlock: from, toBlock: to,
+    });
+    return [...new Set(logs.map(l => l.transactionHash))];
+  } catch (_) {
+    return [];
+  }
 }
 
 async function pollLoop() {
@@ -866,10 +998,28 @@ async function pollLoop() {
       if (cur > lastPollBlock) {
         const from = lastPollBlock + 1;
         const to   = Math.min(cur, lastPollBlock + 20);
+
+        // Direct-to-contract TXs (claims + direct BUYs).
         const txs  = await scanBlocks(from, to);
         for (const tx of txs)
           if (!processedTxs.has(tx.hash))
             await processTx(tx.hash, tx.from, tx.data, tx.blockNum, tx.blockTs);
+
+        // Router-routed BUYs: any mint event from the contract in this range.
+        const mintTxs = await scanMintLogs(from, to);
+        for (const hash of mintTxs) {
+          if (processedTxs.has(hash)) continue;
+          try {
+            const [tx, receipt] = await Promise.all([
+              provider.getTransaction(hash).catch(() => null),
+              provider.getTransactionReceipt(hash).catch(() => null),
+            ]);
+            if (!tx || !receipt) continue;
+            const block = await provider.getBlock(receipt.blockNumber).catch(() => null);
+            await processTx(hash, tx.from, tx.data || '', receipt.blockNumber, block?.timestamp || 0);
+          } catch (_) {}
+        }
+
         lastPollBlock = to;
       }
       fails = 0;
