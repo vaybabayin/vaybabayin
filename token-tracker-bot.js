@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v9.25';
+const VERSION = 'v9.26';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -846,7 +846,38 @@ async function diagnoseTx(txHash) {
       for (const a of allToUser) lines.push(`  • ${a}`);
     }
 
-    if (processedTxs.has(txHash)) lines.push(`⚠️ Bu TX zaten işlendi`);
+    // v9.26: full event dump so we can see what BUY TXs actually emit on
+    // contracts that don't use standard ERC-721 Transfer (where v9.25's
+    // mint scan returns 0). Shows topic count + event signature + emitting
+    // address for every log — enough to reverse-engineer the BUY pattern.
+    lines.push(`\n🧪 Tüm event'ler (${receipt.logs.length} toplam):`);
+    const contractAddr = CONTRACT.toLowerCase();
+    for (let i = 0; i < receipt.logs.length; i++) {
+      const log = receipt.logs[i];
+      const addr = log.address.toLowerCase();
+      const tag  = addr === contractAddr ? '⭐CONTRACT' : addr === USDC_LOWER ? '💵USDC' : `${addr.slice(0,10)}`;
+      const t0   = log.topics[0]?.slice(0, 18) || '-';
+      const nTopics = log.topics.length;
+      let detail = '';
+      if (log.topics[0]?.toLowerCase() === TRANSFER_TOPIC) {
+        if (nTopics === 4) {
+          const f = '0x' + log.topics[1].slice(26);
+          const t = '0x' + log.topics[2].slice(26);
+          const id = BigInt(log.topics[3]).toString();
+          detail = `ERC721 ${f.slice(0,10)}→${t.slice(0,10)} id=${id}`;
+        } else if (nTopics === 3) {
+          const f = '0x' + log.topics[1].slice(26);
+          const t = '0x' + log.topics[2].slice(26);
+          const v = log.data && log.data !== '0x' ? BigInt(log.data).toString() : '0';
+          detail = `ERC20  ${f.slice(0,10)}→${t.slice(0,10)} val=${v.slice(0,12)}`;
+        }
+      } else {
+        detail = `t0=${t0} topics=${nTopics} data=${(log.data||'').slice(0,18)}`;
+      }
+      lines.push(`  ${String(i).padStart(2,'0')} [${tag}] ${detail}`);
+    }
+
+    if (processedTxs.has(txHash)) lines.push(`\n⚠️ Bu TX zaten işlendi`);
     lines.push(`📇 NFT map boyutu: ${nftToTier.size}`);
     lines.push(`📡 Kayıtlı chat: ${registeredChats.size}`);
   } catch (e) {
