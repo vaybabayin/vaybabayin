@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v9.22';
+const VERSION = 'v9.23';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -342,10 +342,17 @@ function classifyByUsdc(usdAmount) {
 // v9.22: find the mint TX hash for an NFT — Blockscout first (fast),
 // eth_getLogs fallback (slower but works when Blockscout doesn't index
 // the token or the mint is outside the default page).
+// v9.23: silenced per-call 404 logs (Blockscout doesn't index this
+// contract's instances at all, so every call 404s — noisy). First
+// getLogs failure is logged once per process so RPC problems are
+// still visible.
+let _bsInstancesDisabled = false;
+let _getLogsErrLogged    = false;
+
 async function findMintTxBlockscout(nftId) {
-  const addr = CONTRACT.toLowerCase();
-  // Try the per-instance transfers endpoint
+  if (_bsInstancesDisabled) return null;
   try {
+    const addr = CONTRACT.toLowerCase();
     const url = `https://base.blockscout.com/api/v2/tokens/${addr}/instances/${nftId}/transfers`;
     const r = await axios.get(url, { timeout: 10000 });
     const items = r.data?.items || [];
@@ -356,7 +363,12 @@ async function findMintTxBlockscout(nftId) {
       }
     }
   } catch (e) {
-    console.log(`[BS instances] nft=${nftId}: ${(e.message || '').slice(0, 60)}`);
+    if (e.response?.status === 404 && !_bsInstancesDisabled) {
+      _bsInstancesDisabled = true;
+      console.log(`[BS instances] 404 for nft=${nftId} — contract not indexed as token instances; disabling this lookup for the session.`);
+    } else if (e.response?.status !== 404) {
+      console.log(`[BS instances] nft=${nftId}: ${(e.message || '').slice(0, 60)}`);
+    }
   }
   return null;
 }
@@ -379,7 +391,12 @@ async function findMintTxOnchain(nftId) {
           fromBlock, toBlock,
         });
         if (logs.length) return logs[0].transactionHash;
-      } catch (_) { /* chunk failed — try next */ }
+      } catch (e) {
+        if (!_getLogsErrLogged) {
+          _getLogsErrLogged = true;
+          console.log(`[getLogs err] first failure: ${(e.message || '').slice(0, 100)} — RPC may not support topic filters or block range`);
+        }
+      }
       if (fromBlock === 0) break;
     }
   } catch (_) {}
@@ -619,9 +636,13 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
   // ($1 = green, $5 = purple). If the in-memory NFT map doesn't have it,
   // recover by pulling the original mint event from Blockscout and reading
   // the USDC payment from that receipt. NEVER guess from the won amount —
-  // a green ticket can legitimately win $30+, which the old USD-range
-  // fallback wrongly rejected.
-  if (tier === null && claimedNftId) {
+  // a green ticket can legitimately win $30+.
+  //
+  // v9.23: only run recovery for live or recent TXs. Old history TXs only
+  // affect stats (no notification fires), so paying the recovery cost for
+  // them stalls startup; the count stays slightly behind for unrecognised
+  // old claims, which is an acceptable trade for fast boot.
+  if (tier === null && claimedNftId && (!isLoadingHistory || isRecentTx)) {
     tier = await recoverTierFromBuyTx(claimedNftId);
   }
 
@@ -983,9 +1004,15 @@ async function main() {
   console.log(`[${VERSION}] Contract: ${CONTRACT}`);
   console.log(`[${VERSION}] green=$1 döngü=${SC1_TARGET} | purple=$5 döngü=${SC5_TARGET}`);
   console.log(`[${VERSION}] BOT_START_TS=${BOT_START_TS} LIVE_WINDOW_SEC=${LIVE_WINDOW_SEC} CG_KEY=${COINGECKO_KEY ? 'yes' : 'no'}`);
-  await loadHistory();
-  console.log(`[HISTORY] NFT map=${nftToTier.size} | green count=${ts(1).count} sessionCount=${ts(1).sessionCount}/${SC1_TARGET}  purple count=${ts(2).count} sessionCount=${ts(2).sessionCount}/${SC5_TARGET}`);
+
+  // v9.23: don't block polling on history. Live BUYs/CLAIMs were being
+  // dropped because loadHistory() could take minutes when many NFT
+  // recoveries fall back to chunked eth_getLogs. Start the live poller
+  // immediately; history backfills stats in parallel.
   lastPollBlock = 0;
+  loadHistory().then(() => {
+    console.log(`[HISTORY] NFT map=${nftToTier.size} | green count=${ts(1).count} sessionCount=${ts(1).sessionCount}/${SC1_TARGET}  purple count=${ts(2).count} sessionCount=${ts(2).sessionCount}/${SC5_TARGET}`);
+  }).catch(e => console.error('[HISTORY bg]', e?.message));
   await pollLoop();
 }
 
