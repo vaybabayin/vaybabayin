@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v9.27';
+const VERSION = 'v9.28';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -233,6 +233,18 @@ async function getTokenPriceUsd(address) {
   const k = address.toLowerCase();
   const cached = priceCache[k];
   if (cached && Date.now() - cached.at < 60_000) return cached.price;
+
+  // v9.28: WETH price comes from Chainlink ETH/USD directly — no need to
+  // bounce through CoinGecko/DexScreener (which can rate-limit) and the
+  // on-chain feed is the most authoritative reference for ETH price.
+  if (k === WETH_LOWER) {
+    const eth = await getEthUsd();
+    if (eth) {
+      priceCache[k] = { price: eth, at: Date.now(), src: 'chainlink' };
+      return eth;
+    }
+  }
+
   const { decimals } = await getTokenInfo(address);
 
   // Source order (most reliable first):
@@ -596,7 +608,11 @@ function collectReceived(receipt, recipient) {
     } else if (fromLog === ZERO_ADDRESS) {
       received[tokenAddr] = (received[tokenAddr] ?? 0n) + amt;
       (sources[tokenAddr] ??= new Set()).add('M');
-    } else if (tokenAddr !== WETH_LOWER) {
+    } else {
+      // v9.28: previously excluded WETH here as a defensive filter against
+      // internal wrapped-ETH movements, but in this contract WETH is a
+      // legitimate reward paid out by the helper (e.g. 0x4a8c9cf2 paid
+      // 0.000047 WETH ≈ $0.12 that was silently dropped from the total).
       fromOther[tokenAddr] = (fromOther[tokenAddr] ?? 0n) + amt;
     }
   }
