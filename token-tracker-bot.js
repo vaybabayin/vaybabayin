@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v9.15';
+const VERSION = 'v9.16';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -15,6 +15,12 @@ if (!TELEGRAM_TOKEN) { console.error('TELEGRAM_BOT_TOKEN eksik!'); process.exit(
 const CONTRACT_LOWER = CONTRACT.toLowerCase();
 const ZERO_ADDRESS   = '0x0000000000000000000000000000000000000000';
 const USDC_LOWER     = '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913';
+
+// TXs timestamped within this many seconds of bot start are treated as
+// "live" even when encountered during history loading, so they still fire
+// a Telegram notification instead of being silently absorbed.
+const BOT_START_TS    = Math.floor(Date.now() / 1000);
+const LIVE_WINDOW_SEC = 300; // 5 minutes
 
 const registeredChats = new Set();
 if (CHANNEL_ID) registeredChats.add(String(CHANNEL_ID));
@@ -244,38 +250,43 @@ function nftIdFromCalldata(data) {
 }
 
 function collectReceived(receipt, recipient) {
-  // Strict pass: only count ERC20 transfers whose `from` is the scratch card
-  // contract itself. Side-effect mints (Transfer(0x0, recipient, ...)) from
-  // unrelated protocols can fire during a claim TX (rebases, yield drips,
-  // accrued rewards), and counting them would inflate the reported total.
-  const received = {};
-  for (const log of receipt.logs) {
-    if (log.topics[0]?.toLowerCase() !== TRANSFER_TOPIC) continue;
-    if (log.topics.length !== 3) continue; // ERC20 only; NFTs have 4 topics
-    const to       = ('0x' + log.topics[2].slice(26)).toLowerCase();
-    const fromLog  = ('0x' + log.topics[1].slice(26)).toLowerCase();
-    if (to !== recipient) continue;
-    if (fromLog !== CONTRACT_LOWER) continue;
-    if (!log.data || log.data === '0x') continue;
-    const tokenAddr = log.address.toLowerCase();
-    received[tokenAddr] = (received[tokenAddr] ?? 0n) + BigInt(log.data);
-  }
-  if (Object.keys(received).length) return { received, usedFallback: false };
+  // Three-tier collection strategy:
+  //   Tier 1 (CONTRACT): transfer directly from the scratch card contract.
+  //     Most common pattern. If any found, use only these — stops spurious
+  //     protocol-level mints from inflating the total.
+  //   Tier 2 (MINT): Transfer(0x0 -> recipient). Used when the contract
+  //     mints reward tokens directly to the user. Only activated when Tier 1
+  //     finds nothing, preventing the double-count seen with Tier 1 + Tier 2
+  //     mixed (the $0.62 vs $0.41 bug).
+  //   Tier 3 (FALLBACK): any ERC20 to recipient except WETH. Last resort for
+  //     router/swap-routed rewards.
+  const fromContract = {};
+  const fromMint     = {};
+  const fromOther    = {};
 
-  // Fallback: contract may route rewards through a swap/router so the final
-  // transfer to user comes from a different address. Last resort, accept any
-  // ERC20 transfer to user except WETH (intermediate swap leg).
   for (const log of receipt.logs) {
     if (log.topics[0]?.toLowerCase() !== TRANSFER_TOPIC) continue;
-    if (log.topics.length !== 3) continue;
-    const to = ('0x' + log.topics[2].slice(26)).toLowerCase();
+    if (log.topics.length !== 3) continue; // ERC20 only; NFTs use 4 topics
+    const to      = ('0x' + log.topics[2].slice(26)).toLowerCase();
+    const fromLog = ('0x' + log.topics[1].slice(26)).toLowerCase();
     if (to !== recipient) continue;
-    const tokenAddr = log.address.toLowerCase();
-    if (tokenAddr === WETH_LOWER) continue;
     if (!log.data || log.data === '0x') continue;
-    received[tokenAddr] = (received[tokenAddr] ?? 0n) + BigInt(log.data);
+    const tokenAddr = log.address.toLowerCase();
+    const amt = BigInt(log.data);
+    if (fromLog === CONTRACT_LOWER) {
+      fromContract[tokenAddr] = (fromContract[tokenAddr] ?? 0n) + amt;
+    } else if (fromLog === ZERO_ADDRESS) {
+      fromMint[tokenAddr] = (fromMint[tokenAddr] ?? 0n) + amt;
+    } else if (tokenAddr !== WETH_LOWER) {
+      fromOther[tokenAddr] = (fromOther[tokenAddr] ?? 0n) + amt;
+    }
   }
-  return { received, usedFallback: true };
+
+  if (Object.keys(fromContract).length)
+    return { received: fromContract, usedFallback: false, src: 'contract' };
+  if (Object.keys(fromMint).length)
+    return { received: fromMint,     usedFallback: false, src: 'mint' };
+  return { received: fromOther, usedFallback: true, src: 'other' };
 }
 
 async function calcTotalUsd(received) {
@@ -310,10 +321,19 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
     const arr = [...processedTxs]; processedTxs = new Set(arr.slice(-10000));
   }
 
+  // Is this TX recent enough to treat as live even during history loading?
+  // Covers the case where the bot restarts and a claim that just happened
+  // lands in the 50-TX history window and would otherwise be silently eaten.
+  const isRecentTx = blockTs >= BOT_START_TS - LIVE_WINDOW_SEC;
+
   let receipt;
-  try { receipt = await provider.getTransactionReceipt(txHash); } catch (_) { return; }
+  try { receipt = await provider.getTransactionReceipt(txHash); } catch (e) {
+    if (!isLoadingHistory || isRecentTx)
+      console.log(`[SKIP rpc-err] ${txHash.slice(0,10)}: ${e.message.slice(0,60)}`);
+    return;
+  }
   if (!receipt || receipt.status === 0) {
-    if (!isLoadingHistory)
+    if (!isLoadingHistory || isRecentTx)
       console.log(`[SKIP receipt] status=${receipt?.status ?? 'null'} | ${txHash.slice(0,10)}`);
     return;
   }
@@ -326,10 +346,10 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
     const tier = classifyByUsdc(usdPaid);
     if (tier) {
       nftToTier.set(mint.nftId, { tier, buyer: mint.to, buyTxHash: txHash, buyTs: blockTs });
-      if (!isLoadingHistory)
+      if (!isLoadingHistory || isRecentTx)
         console.log(`[BUY] nft=${mint.nftId} tier=${tier} (${TIER_INFO[tier].name}) paid=$${usdPaid.toFixed(2)} buyer=${mint.to.slice(0,10)} | ${txHash.slice(0,10)}`);
     } else {
-      if (!isLoadingHistory)
+      if (!isLoadingHistory || isRecentTx)
         console.log(`[BUY ?] nft=${mint.nftId} paid=$${usdPaid.toFixed(2)} (tier yok) | ${txHash.slice(0,10)}`);
     }
     return;
@@ -345,16 +365,16 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
     tier = nftToTier.get(claimedNftId).tier;
   }
 
-  const { received, usedFallback } = collectReceived(receipt, claimer);
+  const { received, usedFallback, src } = collectReceived(receipt, claimer);
   if (!Object.keys(received).length) {
-    if (!isLoadingHistory)
+    if (!isLoadingHistory || isRecentTx)
       console.log(`[SKIP no-transfer] nft=${claimedNftId} | ${txHash.slice(0,10)}`);
     return;
   }
 
   const { totalUsd, tokenSummary, tokenDetail, droppedSummary } = await calcTotalUsd(received);
   if (totalUsd <= 0) {
-    if (!isLoadingHistory)
+    if (!isLoadingHistory || isRecentTx)
       console.log(`[SKIP no-value] nft=${claimedNftId} dropped=[${droppedSummary.join(' ')}] | ${txHash.slice(0,10)}`);
     return;
   }
@@ -362,12 +382,12 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
   if (tier === null) {
     if (totalUsd >= 0.05 && totalUsd < 2.5) tier = 1;
     else if (totalUsd >= 2.5 && totalUsd < 10) tier = 2;
-    if (tier !== null && !isLoadingHistory)
+    if (tier !== null && (!isLoadingHistory || isRecentTx))
       console.log(`[FALLBACK tier=${tier}] nft=${claimedNftId} — mapping yok, USD'den ($${totalUsd.toFixed(2)}) tahmin | ${txHash.slice(0,10)}`);
   }
 
   if (tier === null) {
-    if (!isLoadingHistory)
+    if (!isLoadingHistory || isRecentTx)
       console.log(`[SKIP unknown-tier] nft=${claimedNftId} won=$${totalUsd.toFixed(2)} | ${txHash.slice(0,10)}`);
     return;
   }
@@ -385,11 +405,13 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
   }
 
   state.count++;
-  if (!isLoadingHistory) state.sessionCount++;
+  // Increment sessionCount for live TXs AND for recent TXs found in history.
+  if (!isLoadingHistory || isRecentTx) state.sessionCount++;
   state.history.unshift({ usd: totalUsd, ts: blockTs * 1000, hash: txHash, claimer: from });
   if (state.history.length > Math.max(cycleSize, 200)) state.history.pop();
 
-  if (isLoadingHistory) return;
+  // Suppress notifications for old history TXs; always notify for live and recent.
+  if (isLoadingHistory && !isRecentTx) return;
 
   const pos        = state.sessionCount > 0 ? state.sessionCount : state.count;
   const posInCycle = ((pos - 1) % cycleSize) + 1;
@@ -411,7 +433,7 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
     `🕐 ${date} | <a href="${txUrl}">TX</a>`,
   ].filter(Boolean).join('\n');
 
-  console.log(`[✓] ${tierInfo.name} won=$${totalUsd.toFixed(2)} nft=${claimedNftId} cyc=${posInCycle}/${cycleSize} fb=${usedFallback} | ${tokenDetail.join(' || ')} | ${txHash.slice(0,10)}`);
+  console.log(`[✓] ${tierInfo.name} won=$${totalUsd.toFixed(2)} nft=${claimedNftId} cyc=${posInCycle}/${cycleSize} src=${src} | ${tokenDetail.join(' || ')} | ${txHash.slice(0,10)}`);
   await sendNotification(msg);
 }
 
@@ -451,8 +473,8 @@ async function diagnoseTx(txHash) {
       }
     }
 
-    const { received, usedFallback } = collectReceived(receipt, tx.from.toLowerCase());
-    lines.push(`💸 Recipient transferi: ${Object.keys(received).length} (fallback: ${usedFallback?'evet':'hayır'})`);
+    const { received, usedFallback, src } = collectReceived(receipt, tx.from.toLowerCase());
+    lines.push(`💸 Recipient transferi: ${Object.keys(received).length} (src=${src})`);
     if (Object.keys(received).length) {
       const { totalUsd, tokenDetail, droppedSummary } = await calcTotalUsd(received);
       for (const t of tokenDetail)    lines.push(`  ✓ ${t}`);
@@ -460,23 +482,23 @@ async function diagnoseTx(txHash) {
       lines.push(`💰 Toplam: $${totalUsd.toFixed(4)}`);
     }
 
-    // Show all ERC20 transfers to recipient for full audit
+    // Full audit: all ERC20 transfers to user, tagged by source
     const recipient = tx.from.toLowerCase();
     const allToUser = [];
     for (const log of receipt.logs) {
       if (log.topics[0]?.toLowerCase() !== TRANSFER_TOPIC) continue;
       if (log.topics.length !== 3) continue;
-      const to       = ('0x' + log.topics[2].slice(26)).toLowerCase();
-      const fromLog  = ('0x' + log.topics[1].slice(26)).toLowerCase();
+      const to      = ('0x' + log.topics[2].slice(26)).toLowerCase();
+      const fromLog = ('0x' + log.topics[1].slice(26)).toLowerCase();
       if (to !== recipient) continue;
       if (!log.data || log.data === '0x') continue;
       const tokenAddr = log.address.toLowerCase();
       try {
-        const info = await getTokenInfo(tokenAddr);
+        const info  = await getTokenInfo(tokenAddr);
         const human = Number(ethers.formatUnits(BigInt(log.data), info.decimals));
-        const tag = fromLog === CONTRACT_LOWER ? 'CONTRACT'
-                  : fromLog === ZERO_ADDRESS    ? 'MINT'
-                  : `OTHER(${fromLog.slice(0,8)})`;
+        const tag   = fromLog === CONTRACT_LOWER ? 'CONTRACT'
+                    : fromLog === ZERO_ADDRESS    ? 'MINT'
+                    : `OTHER(${fromLog.slice(0,8)})`;
         allToUser.push(`${info.symbol} ${human.toFixed(6)} ← ${tag}`);
       } catch (_) {}
     }
@@ -522,7 +544,7 @@ async function scanBlocks(fromBlock, toBlock) {
 
 async function loadHistory() {
   isLoadingHistory = true;
-  console.log('[HISTORY] Blockscout API... (bildirimler suspended)');
+  console.log('[HISTORY] Blockscout API... (eski TX\'ler silent, son 5dk bildirimler açık)');
   const countBefore = { 1: ts(1).count, 2: ts(2).count };
   try {
     const r = await axios.get(
@@ -710,6 +732,7 @@ async function main() {
 
   console.log(`[${VERSION}] Contract: ${CONTRACT}`);
   console.log(`[${VERSION}] green=$1 döngü=${SC1_TARGET} | purple=$5 döngü=${SC5_TARGET}`);
+  console.log(`[${VERSION}] BOT_START_TS=${BOT_START_TS} LIVE_WINDOW_SEC=${LIVE_WINDOW_SEC}`);
   await loadHistory();
   console.log(`[HISTORY] NFT map=${nftToTier.size} | green count=${ts(1).count} sessionCount=${ts(1).sessionCount}/${SC1_TARGET}  purple count=${ts(2).count} sessionCount=${ts(2).sessionCount}/${SC5_TARGET}`);
   lastPollBlock = 0;
