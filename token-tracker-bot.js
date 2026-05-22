@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v9.20';
+const VERSION = 'v9.21';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -322,6 +322,39 @@ function classifyByUsdc(usdAmount) {
   return null;
 }
 
+// v9.21: recover NFT → tier mapping from the chain when not in memory
+// (e.g. after a bot restart, or when the BUY happened outside the history
+// window). Pulls the original mint event from Blockscout, reads the USDC
+// payment from that BUY TX's receipt, and classifies the tier.
+async function recoverTierFromBuyTx(nftId) {
+  try {
+    const url = `https://base.blockscout.com/api/v2/tokens/${CONTRACT}/instances/${nftId}/transfers`;
+    const r = await axios.get(url, { timeout: 10000 });
+    const items = r.data?.items || [];
+    const mintItem = items.find(t => (t.from?.hash || '').toLowerCase() === ZERO_ADDRESS);
+    if (!mintItem) return null;
+    const buyTxHash = mintItem.transaction_hash || mintItem.tx_hash;
+    if (!buyTxHash) return null;
+
+    const buyReceipt = await provider.getTransactionReceipt(buyTxHash);
+    if (!buyReceipt) return null;
+    const mint = findNftMint(buyReceipt);
+    if (!mint) return null;
+
+    const usdPaid = findUsdcPayment(buyReceipt, mint.to);
+    const tier    = classifyByUsdc(usdPaid);
+    if (tier) {
+      const buyTs = Math.floor(new Date(mintItem.timestamp).getTime() / 1000) || 0;
+      nftToTier.set(nftId, { tier, buyer: mint.to, buyTxHash, buyTs });
+      console.log(`[RECOVER] nft=${nftId} tier=${tier} (${TIER_INFO[tier].name}) paid=$${usdPaid.toFixed(2)} from ${buyTxHash.slice(0,10)}`);
+    }
+    return tier;
+  } catch (e) {
+    console.log(`[RECOVER fail] nft=${nftId}: ${(e.message || '').slice(0, 80)}`);
+    return null;
+  }
+}
+
 function nftIdFromCalldata(data) {
   if (!data || data.length < 74) return null;
   try { return BigInt('0x' + data.slice(10, 74)).toString(); }
@@ -485,16 +518,19 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
     return;
   }
 
-  if (tier === null) {
-    if (totalUsd >= 0.05 && totalUsd < 2.5) tier = 1;
-    else if (totalUsd >= 2.5 && totalUsd < 10) tier = 2;
-    if (tier !== null && (!isLoadingHistory || isRecentTx))
-      console.log(`[FALLBACK tier=${tier}] nft=${claimedNftId} — mapping yok, USD'den ($${totalUsd.toFixed(2)}) tahmin | ${txHash.slice(0,10)}`);
+  // v9.21: tier is determined ONLY by the USDC payment in the BUY TX
+  // ($1 = green, $5 = purple). If the in-memory NFT map doesn't have it,
+  // recover by pulling the original mint event from Blockscout and reading
+  // the USDC payment from that receipt. NEVER guess from the won amount —
+  // a green ticket can legitimately win $30+, which the old USD-range
+  // fallback wrongly rejected.
+  if (tier === null && claimedNftId) {
+    tier = await recoverTierFromBuyTx(claimedNftId);
   }
 
   if (tier === null) {
     if (!isLoadingHistory || isRecentTx)
-      console.log(`[SKIP unknown-tier] nft=${claimedNftId} won=$${totalUsd.toFixed(2)} | ${txHash.slice(0,10)}`);
+      console.log(`[SKIP unknown-tier] nft=${claimedNftId} won=$${totalUsd.toFixed(2)} (BUY TX bulunamadı) | ${txHash.slice(0,10)}`);
     return;
   }
 
@@ -576,6 +612,14 @@ async function diagnoseTx(txHash) {
       if (fromCd && nftToTier.has(fromCd)) {
         const m = nftToTier.get(fromCd);
         lines.push(`  ✓ Map'te tier=${m.tier} (${TIER_INFO[m.tier].name})`);
+      } else if (fromCd) {
+        lines.push(`  🔎 Map'te yok — BUY TX'ten kurtarmaya çalışıyorum...`);
+        const recovered = await recoverTierFromBuyTx(fromCd);
+        if (recovered) {
+          lines.push(`  ✓ Recovered tier=${recovered} (${TIER_INFO[recovered].name})`);
+        } else {
+          lines.push(`  ✗ BUY TX bulunamadı / USDC ödemesi $1 veya $5 değil`);
+        }
       }
     }
 
