@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v9.14';
+const VERSION = 'v9.15';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -244,22 +244,30 @@ function nftIdFromCalldata(data) {
 }
 
 function collectReceived(receipt, recipient) {
+  // Strict pass: only count ERC20 transfers whose `from` is the scratch card
+  // contract itself. Side-effect mints (Transfer(0x0, recipient, ...)) from
+  // unrelated protocols can fire during a claim TX (rebases, yield drips,
+  // accrued rewards), and counting them would inflate the reported total.
   const received = {};
   for (const log of receipt.logs) {
     if (log.topics[0]?.toLowerCase() !== TRANSFER_TOPIC) continue;
-    if (log.topics.length < 3) continue;
+    if (log.topics.length !== 3) continue; // ERC20 only; NFTs have 4 topics
     const to       = ('0x' + log.topics[2].slice(26)).toLowerCase();
     const fromLog  = ('0x' + log.topics[1].slice(26)).toLowerCase();
-    const tokenAddr = log.address.toLowerCase();
     if (to !== recipient) continue;
-    if (tokenAddr !== CONTRACT_LOWER && fromLog !== CONTRACT_LOWER && fromLog !== ZERO_ADDRESS) continue;
+    if (fromLog !== CONTRACT_LOWER) continue;
     if (!log.data || log.data === '0x') continue;
+    const tokenAddr = log.address.toLowerCase();
     received[tokenAddr] = (received[tokenAddr] ?? 0n) + BigInt(log.data);
   }
   if (Object.keys(received).length) return { received, usedFallback: false };
+
+  // Fallback: contract may route rewards through a swap/router so the final
+  // transfer to user comes from a different address. Last resort, accept any
+  // ERC20 transfer to user except WETH (intermediate swap leg).
   for (const log of receipt.logs) {
     if (log.topics[0]?.toLowerCase() !== TRANSFER_TOPIC) continue;
-    if (log.topics.length < 3) continue;
+    if (log.topics.length !== 3) continue;
     const to = ('0x' + log.topics[2].slice(26)).toLowerCase();
     if (to !== recipient) continue;
     const tokenAddr = log.address.toLowerCase();
@@ -273,6 +281,7 @@ function collectReceived(receipt, recipient) {
 async function calcTotalUsd(received) {
   let totalUsd = 0;
   const tokenSummary = [];
+  const tokenDetail  = [];
   const droppedSummary = [];
   for (const [addr, rawAmt] of Object.entries(received)) {
     try {
@@ -288,9 +297,10 @@ async function calcTotalUsd(received) {
       }
       totalUsd += usd;
       tokenSummary.push(`${info.symbol}=$${usd.toFixed(4)}`);
+      tokenDetail.push(`${info.symbol} ${human.toFixed(6)} @ $${price.toFixed(8)} = $${usd.toFixed(4)}`);
     } catch (_) {}
   }
-  return { totalUsd, tokenSummary, droppedSummary };
+  return { totalUsd, tokenSummary, tokenDetail, droppedSummary };
 }
 
 async function processTx(txHash, from, data, blockNum, blockTs) {
@@ -342,7 +352,7 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
     return;
   }
 
-  const { totalUsd, tokenSummary, droppedSummary } = await calcTotalUsd(received);
+  const { totalUsd, tokenSummary, tokenDetail, droppedSummary } = await calcTotalUsd(received);
   if (totalUsd <= 0) {
     if (!isLoadingHistory)
       console.log(`[SKIP no-value] nft=${claimedNftId} dropped=[${droppedSummary.join(' ')}] | ${txHash.slice(0,10)}`);
@@ -401,7 +411,7 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
     `🕐 ${date} | <a href="${txUrl}">TX</a>`,
   ].filter(Boolean).join('\n');
 
-  console.log(`[✓] ${tierInfo.name} won=$${totalUsd.toFixed(2)} nft=${claimedNftId} cyc=${posInCycle}/${cycleSize} fb=${usedFallback} | ${tokenSummary.join(' ')} | ${txHash.slice(0,10)}`);
+  console.log(`[✓] ${tierInfo.name} won=$${totalUsd.toFixed(2)} nft=${claimedNftId} cyc=${posInCycle}/${cycleSize} fb=${usedFallback} | ${tokenDetail.join(' || ')} | ${txHash.slice(0,10)}`);
   await sendNotification(msg);
 }
 
@@ -444,10 +454,35 @@ async function diagnoseTx(txHash) {
     const { received, usedFallback } = collectReceived(receipt, tx.from.toLowerCase());
     lines.push(`💸 Recipient transferi: ${Object.keys(received).length} (fallback: ${usedFallback?'evet':'hayır'})`);
     if (Object.keys(received).length) {
-      const { totalUsd, tokenSummary, droppedSummary } = await calcTotalUsd(received);
-      for (const t of tokenSummary)   lines.push(`  ✓ ${t}`);
+      const { totalUsd, tokenDetail, droppedSummary } = await calcTotalUsd(received);
+      for (const t of tokenDetail)    lines.push(`  ✓ ${t}`);
       for (const d of droppedSummary) lines.push(`  ✗ ${d}`);
       lines.push(`💰 Toplam: $${totalUsd.toFixed(4)}`);
+    }
+
+    // Show all ERC20 transfers to recipient for full audit
+    const recipient = tx.from.toLowerCase();
+    const allToUser = [];
+    for (const log of receipt.logs) {
+      if (log.topics[0]?.toLowerCase() !== TRANSFER_TOPIC) continue;
+      if (log.topics.length !== 3) continue;
+      const to       = ('0x' + log.topics[2].slice(26)).toLowerCase();
+      const fromLog  = ('0x' + log.topics[1].slice(26)).toLowerCase();
+      if (to !== recipient) continue;
+      if (!log.data || log.data === '0x') continue;
+      const tokenAddr = log.address.toLowerCase();
+      try {
+        const info = await getTokenInfo(tokenAddr);
+        const human = Number(ethers.formatUnits(BigInt(log.data), info.decimals));
+        const tag = fromLog === CONTRACT_LOWER ? 'CONTRACT'
+                  : fromLog === ZERO_ADDRESS    ? 'MINT'
+                  : `OTHER(${fromLog.slice(0,8)})`;
+        allToUser.push(`${info.symbol} ${human.toFixed(6)} ← ${tag}`);
+      } catch (_) {}
+    }
+    if (allToUser.length) {
+      lines.push(`📥 Tüm transferler (user'a):`);
+      for (const a of allToUser) lines.push(`  • ${a}`);
     }
 
     if (processedTxs.has(txHash)) lines.push(`⚠️ Bu TX zaten işlendi`);
