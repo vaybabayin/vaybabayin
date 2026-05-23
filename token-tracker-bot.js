@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v9.33';
+const VERSION = 'v9.34';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -68,7 +68,7 @@ let priceCache = {};
 let ethPrice = 0, ethPriceAt = 0;
 let lastPollBlock = 0;
 let isLoadingHistory = false;
-let _recentTiersScanDone = false;
+let _recentTiersPromise = null;
 // v9.27: the NFT itself lives on a separate contract (e.g. 0x154dacde...)
 // while CONTRACT is just the coordinator. Auto-detect from the first
 // mint/burn we see; optionally bootstrap from NFT_CONTRACT env.
@@ -304,6 +304,9 @@ function rememberNftContract(receipt) {
     if (f === ZERO_ADDRESS || t === ZERO_ADDRESS) {
       _nftContractAddr = log.address.toLowerCase();
       console.log(`[NFT contract] tespit edildi: ${_nftContractAddr}`);
+      // v9.34: kick off background tier scan now that we know the NFT contract.
+      // Any later recovery call will await the same in-flight promise.
+      ensureRecentTiers().catch(() => {});
       return;
     }
   }
@@ -582,50 +585,84 @@ async function recoverTierFromBuyTx(nftId) {
   }
 }
 
-// v9.33: on the first claim with unknown tier, scan the NFT contract for
-// ALL mints in the last ~5 hours and register every BUY TX's tier in
-// nftToTier. One getLogs call replaces N per-token-ID getLogs calls —
-// much more RPC-efficient and less likely to fail due to 4-topic filter
-// issues on some nodes. Only runs once per session (idempotent).
+// v9.33+v9.34: scan recent BUY TXs and populate nftToTier with their tier
+// info. Concurrent callers share one in-flight scan via _recentTiersPromise.
+// Strategy: union TX hashes from BOTH the NFT contract's mint events AND
+// the coordinator's event logs, falling back to main RPC if Blockscout
+// returns empty / errors. This redundancy is essential because the
+// Blockscout eth-rpc sometimes returns 0 logs for valid block ranges on
+// contracts it hasn't indexed well — silently breaking tier recovery.
 async function ensureRecentTiers() {
-  if (_recentTiersScanDone || !_nftContractAddr) return;
-  _recentTiersScanDone = true;
-  try {
-    const lp = await getLogsProvider();
-    const useLp = lp || provider;
-    const latest = await useLp.getBlockNumber();
-    const fromZeroTopic = '0x' + '0'.repeat(64);
-    const mintLogs = await useLp.getLogs({
-      address: _nftContractAddr,
-      topics: [TRANSFER_TOPIC, fromZeroTopic],
-      fromBlock: Math.max(0, latest - 9000),
-      toBlock: latest,
-    });
-    const txHashes = [...new Set(mintLogs.map(l => l.transactionHash))];
-    console.log(`[ensureRecentTiers] ${mintLogs.length} mint log → ${txHashes.length} BUY TX taranıyor`);
-    for (const hash of txHashes) {
-      try {
-        const receipt = await provider.getTransactionReceipt(hash).catch(() => null);
-        if (!receipt || receipt.status !== 1) continue;
-        const mints = findAllNftMints(receipt);
-        if (!mints.length) continue;
-        const firstMint = mints[0];
-        const usdPaid = findUsdcPayment(receipt, firstMint.to);
-        const perCard = usdPaid / mints.length;
-        const tier = classifyByUsdc(perCard);
-        if (!tier) continue;
-        const block = await provider.getBlock(receipt.blockNumber).catch(() => null);
-        for (const m of mints) {
-          if (!nftToTier.has(m.nftId))
-            nftToTier.set(m.nftId, { tier, buyer: m.to, buyTxHash: hash, buyTs: block?.timestamp || 0 });
+  if (_recentTiersPromise) return _recentTiersPromise;
+  if (!_nftContractAddr) return;
+  _recentTiersPromise = (async () => {
+    try {
+      const lp = await getLogsProvider();
+      const useLp = lp || provider;
+      const latest = await useLp.getBlockNumber();
+      const fromBlock = Math.max(0, latest - 9000);
+      const fromZeroTopic = '0x' + '0'.repeat(64);
+      const allHashes = new Set();
+
+      const tryGetLogs = async (rpc, params, label) => {
+        try {
+          const logs = await rpc.getLogs(params);
+          for (const l of logs) allHashes.add(l.transactionHash);
+          return logs.length;
+        } catch (e) {
+          console.log(`[ensureRecentTiers ${label}] ${(e.message || '').slice(0, 70)}`);
+          return -1;
         }
-      } catch (_) {}
+      };
+
+      // Pass 1: try Blockscout for both endpoints in parallel
+      const [n1, n2] = await Promise.all([
+        tryGetLogs(useLp, { address: _nftContractAddr, topics: [TRANSFER_TOPIC, fromZeroTopic], fromBlock, toBlock: latest }, 'bs-mint'),
+        tryGetLogs(useLp, { address: CONTRACT_LOWER, fromBlock, toBlock: latest }, 'bs-coord'),
+      ]);
+
+      // Pass 2: if Blockscout returned empty/errored on either, retry on main RPC
+      if (useLp !== provider && (n1 <= 0 || n2 <= 0)) {
+        await Promise.all([
+          n1 <= 0 ? tryGetLogs(provider, { address: _nftContractAddr, topics: [TRANSFER_TOPIC, fromZeroTopic], fromBlock, toBlock: latest }, 'main-mint') : null,
+          n2 <= 0 ? tryGetLogs(provider, { address: CONTRACT_LOWER, fromBlock, toBlock: latest }, 'main-coord') : null,
+        ].filter(Boolean));
+      }
+
+      console.log(`[ensureRecentTiers] ${allHashes.size} TX adayı (bs mint=${n1} coord=${n2}) — receipt taranıyor`);
+
+      let registered = 0;
+      for (const hash of allHashes) {
+        try {
+          const receipt = await provider.getTransactionReceipt(hash).catch(() => null);
+          if (!receipt || receipt.status !== 1) continue;
+          const mints = findAllNftMints(receipt);
+          if (!mints.length) continue;
+          const firstMint = mints[0];
+          const usdPaid = findUsdcPayment(receipt, firstMint.to);
+          const perCard = usdPaid / mints.length;
+          const tier = classifyByUsdc(perCard);
+          if (!tier) continue;
+          const block = await provider.getBlock(receipt.blockNumber).catch(() => null);
+          for (const m of mints) {
+            if (!nftToTier.has(m.nftId)) {
+              nftToTier.set(m.nftId, { tier, buyer: m.to, buyTxHash: hash, buyTs: block?.timestamp || 0 });
+              registered++;
+            }
+          }
+        } catch (_) {}
+      }
+      console.log(`[ensureRecentTiers] tamamlandı — ${registered} yeni tier | map=${nftToTier.size}`);
+    } catch (e) {
+      console.log(`[ensureRecentTiers] hata: ${(e.message || '').slice(0, 80)}`);
+      _recentTiersPromise = null; // null on error → retry next call
+      throw e;
     }
-    console.log(`[ensureRecentTiers] tamamlandı — nftToTier boyutu: ${nftToTier.size}`);
-  } catch (e) {
-    _recentTiersScanDone = false; // retry on next unknown-tier claim
-    console.log(`[ensureRecentTiers] hata: ${(e.message || '').slice(0, 80)}`);
-  }
+  })();
+  try {
+    await _recentTiersPromise;
+  } catch (_) {}
+  return _recentTiersPromise;
 }
 
 function nftIdFromCalldata(data) {
@@ -887,6 +924,13 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
 
 async function diagnoseTx(txHash) {
   const lines = [`🔍 TX: <code>${txHash}</code>`];
+  // v9.34: validate format up front so users see a clear error instead of
+  // a raw RPC "invalid string length" when they accidentally paste a
+  // contract address (40 hex chars) instead of a TX hash (64 hex chars).
+  if (typeof txHash !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(txHash)) {
+    lines.push(`❌ Geçersiz TX hash. 0x + 64 hex karakter bekleniyor (32 byte). Şu an: ${txHash?.length ?? 0} karakter.`);
+    return lines.join('\n');
+  }
   try {
     const tx = await provider.getTransaction(txHash);
     if (!tx) { lines.push('❌ TX bulunamadı'); return lines.join('\n'); }
