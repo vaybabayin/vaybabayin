@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v9.31';
+const VERSION = 'v9.32';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -721,25 +721,11 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
       for (const m of allMints) {
         nftToTier.set(m.nftId, { tier, buyer: m.to, buyTxHash: txHash, buyTs: blockTs });
       }
-      console.log(`[BUY] mints=${allMints.length} tier=${tier} (${TIER_INFO[tier].name}) totalPaid=$${usdPaid.toFixed(2)} perCard=$${perCard.toFixed(2)} buyer=${firstMint.to.slice(0,10)} ids=[${allMints.map(m=>m.nftId).join(',')}] | ${txHash.slice(0,10)}`);
-      // v9.31: notify on BUY so the user sees each new package immediately
-      if (!isLoadingHistory || isRecentTx) {
-        const ti   = TIER_INFO[tier];
-        const date = new Date(blockTs * 1000).toISOString().replace('T', ' ').slice(0, 19) + 'Z';
-        const txUrl = `https://basescan.org/tx/${txHash}`;
-        const nftList = allMints.length === 1
-          ? `#${allMints[0].nftId}`
-          : allMints.map(m => `#${m.nftId}`).join(', ') + ` (${allMints.length} adet)`;
-        const buyMsg = [
-          `${ti.emoji} Yeni Paket Alındı [${ti.name} / $${ti.payUsd} USDC]`,
-          `📦 NFT: ${nftList}`,
-          `👤 ${firstMint.to}`,
-          `🕐 ${date} | <a href="${txUrl}">TX</a>`,
-        ].join('\n');
-        await sendNotification(buyMsg);
-      }
+      if (!isLoadingHistory || isRecentTx)
+        console.log(`[BUY] mints=${allMints.length} tier=${tier} (${TIER_INFO[tier].name}) totalPaid=$${usdPaid.toFixed(2)} perCard=$${perCard.toFixed(2)} buyer=${firstMint.to.slice(0,10)} ids=[${allMints.map(m=>m.nftId).join(',')}] | ${txHash.slice(0,10)}`);
     } else {
-      console.log(`[BUY ?] mints=${allMints.length} totalPaid=$${usdPaid.toFixed(2)} perCard=$${perCard.toFixed(2)} (tier yok) | ${txHash.slice(0,10)}`);
+      if (!isLoadingHistory || isRecentTx)
+        console.log(`[BUY ?] mints=${allMints.length} totalPaid=$${usdPaid.toFixed(2)} perCard=$${perCard.toFixed(2)} (tier yok) | ${txHash.slice(0,10)}`);
     }
     return;
   }
@@ -1111,20 +1097,30 @@ async function loadHistory() {
 // — the actual NFTs live on a separate contract (auto-detected). Without
 // _nftContractAddr known we can't scan (returns []); the address gets
 // learned on the first BUY/CLAIM processed.
+// v9.32: throws on persistent RPC failure (after fallback) so the caller's
+// outer catch keeps lastPollBlock unchanged — silent [] would lose claims.
 async function scanMintLogs(from, to) {
   if (!_nftContractAddr) return [];
+  const fromZeroTopic = '0x' + '0'.repeat(64);
+  const lp = await getLogsProvider();
+  const useLp = lp || provider;
   try {
-    const lp = await getLogsProvider();
-    const useLp = lp || provider;
-    const fromZeroTopic = '0x' + '0'.repeat(64);
     const logs = await useLp.getLogs({
       address: _nftContractAddr,
       topics: [TRANSFER_TOPIC, fromZeroTopic],
       fromBlock: from, toBlock: to,
     });
     return [...new Set(logs.map(l => l.transactionHash))];
-  } catch (_) {
-    return [];
+  } catch (e) {
+    if (useLp !== provider) {
+      const logs = await provider.getLogs({
+        address: _nftContractAddr,
+        topics: [TRANSFER_TOPIC, fromZeroTopic],
+        fromBlock: from, toBlock: to,
+      });
+      return [...new Set(logs.map(l => l.transactionHash))];
+    }
+    throw e;
   }
 }
 
@@ -1135,19 +1131,53 @@ async function scanMintLogs(from, to) {
 // Coinbase Smart Wallet / ERC-4337 AA (tx.to=EntryPoint but CONTRACT still
 // emits), and batched / multicall TXs. Replaces the tx.to===CONTRACT block
 // scan which was blind to anything routed through a proxy or bundler.
+// v9.32: now throws on persistent RPC failure (after Blockscout->main RPC
+// fallback) so pollLoop's outer catch can keep lastPollBlock from advancing
+// past unscanned blocks. Previously a silent [] meant claims in those
+// blocks were lost forever.
 async function scanCoordinatorLogs(from, to) {
+  const lp = await getLogsProvider();
+  const useLp = lp || provider;
   try {
-    const lp = await getLogsProvider();
-    const useLp = lp || provider;
     const logs = await useLp.getLogs({
       address: CONTRACT_LOWER,
       fromBlock: from,
       toBlock: to,
     });
     return [...new Set(logs.map(l => l.transactionHash))];
-  } catch (_) {
-    return [];
+  } catch (e) {
+    if (useLp !== provider) {
+      const logs = await provider.getLogs({
+        address: CONTRACT_LOWER,
+        fromBlock: from,
+        toBlock: to,
+      });
+      return [...new Set(logs.map(l => l.transactionHash))];
+    }
+    throw e;
   }
+}
+
+// v9.32: fetch tx + receipt + block with retries. The per-TX RPC calls in
+// pollLoop were silently dropping claims when getTransaction returned null
+// due to transient RPC failures (e.g. propagation lag, rate limits).
+// Returns null only after 4 attempts with backoff.
+async function fetchTxBundle(hash) {
+  const MAX_TRIES = 4;
+  for (let i = 0; i < MAX_TRIES; i++) {
+    try {
+      const [tx, receipt] = await Promise.all([
+        provider.getTransaction(hash),
+        provider.getTransactionReceipt(hash),
+      ]);
+      if (tx && receipt) {
+        const block = await provider.getBlock(receipt.blockNumber).catch(() => null);
+        return { tx, receipt, block };
+      }
+    } catch (_) {}
+    if (i < MAX_TRIES - 1) await new Promise(r => setTimeout(r, 500 * (i + 1)));
+  }
+  return null;
 }
 
 async function pollLoop() {
@@ -1168,15 +1198,16 @@ async function pollLoop() {
         const coordTxs = await scanCoordinatorLogs(from, to);
         for (const hash of coordTxs) {
           if (processedTxs.has(hash)) continue;
+          const bundle = await fetchTxBundle(hash);
+          if (!bundle) {
+            console.log(`[POLL miss] ${hash.slice(0,10)} fetch failed after retries — block ${from}-${to}`);
+            continue;
+          }
           try {
-            const [tx, receipt] = await Promise.all([
-              provider.getTransaction(hash).catch(() => null),
-              provider.getTransactionReceipt(hash).catch(() => null),
-            ]);
-            if (!tx || !receipt) continue;
-            const block = await provider.getBlock(receipt.blockNumber).catch(() => null);
-            await processTx(hash, tx.from, tx.data || '', receipt.blockNumber, block?.timestamp || 0);
-          } catch (_) {}
+            await processTx(hash, bundle.tx.from, bundle.tx.data || '', bundle.receipt.blockNumber, bundle.block?.timestamp || 0);
+          } catch (e) {
+            console.error(`[POLL processTx] ${hash.slice(0,10)}: ${e.message?.slice(0,80)}`);
+          }
         }
 
         // Supplementary: NFT contract mint scan — backup for BUYs in case
@@ -1184,15 +1215,16 @@ async function pollLoop() {
         const mintTxs = await scanMintLogs(from, to);
         for (const hash of mintTxs) {
           if (processedTxs.has(hash)) continue;
+          const bundle = await fetchTxBundle(hash);
+          if (!bundle) {
+            console.log(`[POLL miss] ${hash.slice(0,10)} (mint scan) fetch failed after retries`);
+            continue;
+          }
           try {
-            const [tx, receipt] = await Promise.all([
-              provider.getTransaction(hash).catch(() => null),
-              provider.getTransactionReceipt(hash).catch(() => null),
-            ]);
-            if (!tx || !receipt) continue;
-            const block = await provider.getBlock(receipt.blockNumber).catch(() => null);
-            await processTx(hash, tx.from, tx.data || '', receipt.blockNumber, block?.timestamp || 0);
-          } catch (_) {}
+            await processTx(hash, bundle.tx.from, bundle.tx.data || '', bundle.receipt.blockNumber, bundle.block?.timestamp || 0);
+          } catch (e) {
+            console.error(`[POLL processTx mint] ${hash.slice(0,10)}: ${e.message?.slice(0,80)}`);
+          }
         }
 
         lastPollBlock = to;
