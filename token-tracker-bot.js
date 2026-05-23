@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v9.30';
+const VERSION = 'v9.31';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -721,11 +721,25 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
       for (const m of allMints) {
         nftToTier.set(m.nftId, { tier, buyer: m.to, buyTxHash: txHash, buyTs: blockTs });
       }
-      if (!isLoadingHistory || isRecentTx)
-        console.log(`[BUY] mints=${allMints.length} tier=${tier} (${TIER_INFO[tier].name}) totalPaid=$${usdPaid.toFixed(2)} perCard=$${perCard.toFixed(2)} buyer=${firstMint.to.slice(0,10)} ids=[${allMints.map(m=>m.nftId).join(',')}] | ${txHash.slice(0,10)}`);
+      console.log(`[BUY] mints=${allMints.length} tier=${tier} (${TIER_INFO[tier].name}) totalPaid=$${usdPaid.toFixed(2)} perCard=$${perCard.toFixed(2)} buyer=${firstMint.to.slice(0,10)} ids=[${allMints.map(m=>m.nftId).join(',')}] | ${txHash.slice(0,10)}`);
+      // v9.31: notify on BUY so the user sees each new package immediately
+      if (!isLoadingHistory || isRecentTx) {
+        const ti   = TIER_INFO[tier];
+        const date = new Date(blockTs * 1000).toISOString().replace('T', ' ').slice(0, 19) + 'Z';
+        const txUrl = `https://basescan.org/tx/${txHash}`;
+        const nftList = allMints.length === 1
+          ? `#${allMints[0].nftId}`
+          : allMints.map(m => `#${m.nftId}`).join(', ') + ` (${allMints.length} adet)`;
+        const buyMsg = [
+          `${ti.emoji} Yeni Paket Alındı [${ti.name} / $${ti.payUsd} USDC]`,
+          `📦 NFT: ${nftList}`,
+          `👤 ${firstMint.to}`,
+          `🕐 ${date} | <a href="${txUrl}">TX</a>`,
+        ].join('\n');
+        await sendNotification(buyMsg);
+      }
     } else {
-      if (!isLoadingHistory || isRecentTx)
-        console.log(`[BUY ?] mints=${allMints.length} totalPaid=$${usdPaid.toFixed(2)} perCard=$${perCard.toFixed(2)} (tier yok) | ${txHash.slice(0,10)}`);
+      console.log(`[BUY ?] mints=${allMints.length} totalPaid=$${usdPaid.toFixed(2)} perCard=$${perCard.toFixed(2)} (tier yok) | ${txHash.slice(0,10)}`);
     }
     return;
   }
@@ -1285,6 +1299,22 @@ async function main() {
     await bot.sendMessage(msg.chat.id, '🔕 Bildirim listesinden çıkarıldı.');
   });
 
+  bot.onText(/\/komut/, async (msg) => {
+    const lines = [
+      `📋 <b>Komut Listesi</b> ${VERSION}`,
+      '',
+      '/start — Botu başlat, döngü sayıcısını ayarla',
+      '/track — Bu chati bildirim listesine ekle',
+      '/stop — Bildirimleri durdur',
+      '/test — Bot durumu ve NFT map özeti',
+      '/sc1 — 🟢 Green ($1 USDC) istatistikleri',
+      '/sc5 — 🟣 Purple ($5 USDC) istatistikleri',
+      '/komut — Bu listeyi göster',
+      '/diag &lt;TX_HASH&gt; — Belirli bir TX\'i analiz et',
+    ];
+    await bot.sendMessage(msg.chat.id, lines.join('\n'), { parse_mode: 'HTML' });
+  });
+
   bot.onText(/\/test/, async (msg) => {
     const chatId = msg.chat.id;
     registeredChats.add(String(chatId));
@@ -1330,14 +1360,8 @@ async function main() {
   console.log(`[${VERSION}] green=$1 döngü=${SC1_TARGET} | purple=$5 döngü=${SC5_TARGET}`);
   console.log(`[${VERSION}] BOT_START_TS=${BOT_START_TS} LIVE_WINDOW_SEC=${LIVE_WINDOW_SEC} CG_KEY=${COINGECKO_KEY ? 'yes' : 'no'}`);
 
-  // v9.23: don't block polling on history. Live BUYs/CLAIMs were being
-  // dropped because loadHistory() could take minutes when many NFT
-  // recoveries fall back to chunked eth_getLogs. Start the live poller
-  // immediately; history backfills stats in parallel.
+  // v9.31: start live polling immediately with no history preload.
   lastPollBlock = 0;
-  loadHistory().then(() => {
-    console.log(`[HISTORY] NFT map=${nftToTier.size} | green count=${ts(1).count} sessionCount=${ts(1).sessionCount}/${SC1_TARGET}  purple count=${ts(2).count} sessionCount=${ts(2).sessionCount}/${SC5_TARGET}`);
-  }).catch(e => console.error('[HISTORY bg]', e?.message));
   await pollLoop();
 }
 
