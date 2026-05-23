@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v9.32';
+const VERSION = 'v9.33';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -68,6 +68,7 @@ let priceCache = {};
 let ethPrice = 0, ethPriceAt = 0;
 let lastPollBlock = 0;
 let isLoadingHistory = false;
+let _recentTiersScanDone = false;
 // v9.27: the NFT itself lives on a separate contract (e.g. 0x154dacde...)
 // while CONTRACT is just the coordinator. Auto-detect from the first
 // mint/burn we see; optionally bootstrap from NFT_CONTRACT env.
@@ -528,6 +529,16 @@ async function findMintTxHash(nftId) {
 // as $5 = purple). Registers ALL minted NFTs from that BUY TX, not just
 // the one being recovered — future claims for siblings will hit the map.
 async function recoverTierFromBuyTx(nftId) {
+  // v9.33: scan all recent BUY TXs first (one getLogs call, much faster /
+  // more reliable than per-token-ID 4-topic filter scans). After this, the
+  // nftToTier map has every card bought in the last ~5 hours.
+  await ensureRecentTiers();
+  if (nftToTier.has(nftId)) {
+    const info = nftToTier.get(nftId);
+    console.log(`[RECOVER cache] nft=${nftId} tier=${info.tier} (${TIER_INFO[info.tier].name})`);
+    return info.tier;
+  }
+
   try {
     const found = await findMintTxHash(nftId);
     if (!found) {
@@ -568,6 +579,52 @@ async function recoverTierFromBuyTx(nftId) {
   } catch (e) {
     console.log(`[RECOVER fail] nft=${nftId}: ${(e.message || '').slice(0, 80)}`);
     return null;
+  }
+}
+
+// v9.33: on the first claim with unknown tier, scan the NFT contract for
+// ALL mints in the last ~5 hours and register every BUY TX's tier in
+// nftToTier. One getLogs call replaces N per-token-ID getLogs calls —
+// much more RPC-efficient and less likely to fail due to 4-topic filter
+// issues on some nodes. Only runs once per session (idempotent).
+async function ensureRecentTiers() {
+  if (_recentTiersScanDone || !_nftContractAddr) return;
+  _recentTiersScanDone = true;
+  try {
+    const lp = await getLogsProvider();
+    const useLp = lp || provider;
+    const latest = await useLp.getBlockNumber();
+    const fromZeroTopic = '0x' + '0'.repeat(64);
+    const mintLogs = await useLp.getLogs({
+      address: _nftContractAddr,
+      topics: [TRANSFER_TOPIC, fromZeroTopic],
+      fromBlock: Math.max(0, latest - 9000),
+      toBlock: latest,
+    });
+    const txHashes = [...new Set(mintLogs.map(l => l.transactionHash))];
+    console.log(`[ensureRecentTiers] ${mintLogs.length} mint log → ${txHashes.length} BUY TX taranıyor`);
+    for (const hash of txHashes) {
+      try {
+        const receipt = await provider.getTransactionReceipt(hash).catch(() => null);
+        if (!receipt || receipt.status !== 1) continue;
+        const mints = findAllNftMints(receipt);
+        if (!mints.length) continue;
+        const firstMint = mints[0];
+        const usdPaid = findUsdcPayment(receipt, firstMint.to);
+        const perCard = usdPaid / mints.length;
+        const tier = classifyByUsdc(perCard);
+        if (!tier) continue;
+        const block = await provider.getBlock(receipt.blockNumber).catch(() => null);
+        for (const m of mints) {
+          if (!nftToTier.has(m.nftId))
+            nftToTier.set(m.nftId, { tier, buyer: m.to, buyTxHash: hash, buyTs: block?.timestamp || 0 });
+        }
+      } catch (_) {}
+    }
+    console.log(`[ensureRecentTiers] tamamlandı — nftToTier boyutu: ${nftToTier.size}`);
+  } catch (e) {
+    _recentTiersScanDone = false; // retry on next unknown-tier claim
+    console.log(`[ensureRecentTiers] hata: ${(e.message || '').slice(0, 80)}`);
   }
 }
 
@@ -769,8 +826,17 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
   }
 
   if (tier === null) {
-    if (!isLoadingHistory || isRecentTx)
-      console.log(`[SKIP unknown-tier] nft=${claimedNftId} won=$${totalUsd.toFixed(2)} (BUY TX bulunamadı) | ${txHash.slice(0,10)}`);
+    // v9.33: never silently drop a real claim — send a ❓ notification so
+    // the user sees the won amount even when tier recovery fails completely.
+    const date = new Date(blockTs * 1000).toISOString().replace('T', ' ').slice(0, 19) + 'Z';
+    const txUrl = `https://basescan.org/tx/${txHash}`;
+    const unknownMsg = [
+      `❓ Total Value: $${totalUsd.toFixed(2)} [kart #${claimedNftId ?? '?'} — tier bilinmiyor]`,
+      `👤 ${claimer}`,
+      `🕐 ${date} | <a href="${txUrl}">TX</a>`,
+    ].join('\n');
+    console.log(`[? tier] won=$${totalUsd.toFixed(2)} nft=${claimedNftId} | ${txHash.slice(0,10)}`);
+    await sendNotification(unknownMsg);
     return;
   }
 
