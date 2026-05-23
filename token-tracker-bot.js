@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v9.29';
+const VERSION = 'v9.30';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -993,10 +993,14 @@ async function loadHistory() {
   } catch (e) { console.error('[HISTORY tx]', e.message); }
 
   // (2) v9.27: scan the NFT contract for recent mint events to populate
-  // nftToTier for every BUY in the last ~2.3 days, regardless of how the
+  // nftToTier for every BUY in the last ~5 hours, regardless of how the
   // BUY TX itself was routed. The NFT contract address was learned during
   // step (1) via rememberNftContract; if no claim/buy was seen yet (e.g.
   // empty history) we skip the scan.
+  // v9.30: window reduced from 100k blocks (~2.3 days) to 9k (~5h) — old
+  // BUYs whose siblings already claimed don't need recovery, and shortening
+  // the window cuts startup time materially.
+  const HISTORY_LOOKBACK = 9000;  // ~5 hours on Base (2s blocks)
   if (!_nftContractAddr) {
     console.log('[HISTORY] NFT contract henüz öğrenilmedi — mint scan atlanıyor');
   } else try {
@@ -1004,7 +1008,7 @@ async function loadHistory() {
     const useLp = lp || provider;
     const latest = await useLp.getBlockNumber();
     const fromZeroTopic = '0x' + '0'.repeat(64);
-    const fromBlock = Math.max(0, latest - 100_000);  // ~2.3 days on Base
+    const fromBlock = Math.max(0, latest - HISTORY_LOOKBACK);
     let mintLogs = [];
     try {
       mintLogs = await useLp.getLogs({
@@ -1015,7 +1019,7 @@ async function loadHistory() {
     } catch (e) {
       console.log(`[HISTORY mints err] ${(e.message || '').slice(0, 80)} — fallback to chunked main RPC`);
       const CHUNK = 9999;
-      for (let off = 0; off < 100_000; off += CHUNK) {
+      for (let off = 0; off < HISTORY_LOOKBACK; off += CHUNK) {
         const to = latest - off;
         const fr = Math.max(0, to - CHUNK + 1);
         if (to < fr) break;
@@ -1032,7 +1036,7 @@ async function loadHistory() {
       }
     }
     const uniqueTxs = [...new Set(mintLogs.map(l => l.transactionHash))];
-    console.log(`[HISTORY] ${mintLogs.length} mint log -> ${uniqueTxs.length} eşsiz BUY TX (son ~2.3 gün) | NFT contract: ${_nftContractAddr}`);
+    console.log(`[HISTORY] ${mintLogs.length} mint log -> ${uniqueTxs.length} eşsiz BUY TX (son ~5 saat) | NFT contract: ${_nftContractAddr}`);
     for (const hash of uniqueTxs) {
       if (processedTxs.has(hash)) continue;
       try {
@@ -1048,14 +1052,14 @@ async function loadHistory() {
   } catch (e) { console.error('[HISTORY mints]', e.message); }
 
   // (3) v9.29: scan coordinator logs for ALL interactions (BUYs + CLAIMs)
-  // in the last ~2.3 days. Catches CLAIMs from AA wallets that never appear
+  // in the last ~5 hours. Catches CLAIMs from AA wallets that never appear
   // in Blockscout's direct-TX address history (step 1 only lists tx.to=CONTRACT).
   // Also catches any direct CLAIMs missed because step 1 is capped at 50 TXs.
   try {
     const lp3 = await getLogsProvider();
     const useLp3 = lp3 || provider;
     const latestCoord = await useLp3.getBlockNumber();
-    const fromBlockCoord = Math.max(0, latestCoord - 100_000);
+    const fromBlockCoord = Math.max(0, latestCoord - HISTORY_LOOKBACK);
     let coordLogs = [];
     try {
       coordLogs = await useLp3.getLogs({
@@ -1067,7 +1071,7 @@ async function loadHistory() {
       console.log(`[HISTORY coord] getLogs err: ${(e.message || '').slice(0, 80)}`);
     }
     const coordTxHashes = [...new Set(coordLogs.map(l => l.transactionHash))];
-    console.log(`[HISTORY] ${coordLogs.length} coordinator log -> ${coordTxHashes.length} TX (AA/batched) | son ~2.3 gün`);
+    console.log(`[HISTORY] ${coordLogs.length} coordinator log -> ${coordTxHashes.length} TX (AA/batched) | son ~5 saat`);
     for (const hash of coordTxHashes) {
       if (processedTxs.has(hash)) continue;
       try {
