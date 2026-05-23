@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v9.35';
+const VERSION = 'v9.36';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -866,17 +866,9 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
   }
 
   if (tier === null) {
-    // v9.33: never silently drop a real claim — send a ❓ notification so
-    // the user sees the won amount even when tier recovery fails completely.
-    const date = new Date(blockTs * 1000).toISOString().replace('T', ' ').slice(0, 19) + 'Z';
-    const txUrl = `https://basescan.org/tx/${txHash}`;
-    const unknownMsg = [
-      `❓ Total Value: $${totalUsd.toFixed(2)} [kart #${claimedNftId ?? '?'} — tier bilinmiyor]`,
-      `👤 ${claimer}`,
-      `🕐 ${date} | <a href="${txUrl}">TX</a>`,
-    ].join('\n');
-    console.log(`[? tier] won=$${totalUsd.toFixed(2)} nft=${claimedNftId} | ${txHash.slice(0,10)}`);
-    await sendNotification(unknownMsg);
+    // v9.36: not a $1 or $5 scratch card — silently skip, no notification, no log spam.
+    // Coordinator emits events for other interactions too; if tier recovery
+    // can't classify it as green or purple it's not a card we track.
     return;
   }
 
