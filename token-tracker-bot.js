@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v9.28';
+const VERSION = 'v9.29';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -699,7 +699,13 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
 
   rememberNftContract(receipt);
 
-  const claimer = from.toLowerCase();
+  // v9.29: for AA wallets (Coinbase Smart Wallet / ERC-4337) tx.from is the
+  // bundler, not the actual claimer. The NFT burn event's 'from' is the smart
+  // wallet that burned the card — the same address that receives reward tokens.
+  // Detecting this before collectReceived ensures we filter for the right recipient.
+  // For standard EOA wallets, burn.from === tx.from so behaviour is unchanged.
+  const burn = findNftBurn(receipt);
+  const claimer = burn ? burn.from.toLowerCase() : from.toLowerCase();
 
   // v9.22: support multi-mint BUY TXs (buyer mints N cards in one TX).
   // Per-card price = totalUsdcPaid / N. Without this, 5×$1 cards would be
@@ -732,9 +738,8 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
   const { received, usedFallback, src, sources } = collectReceived(receipt, claimer);
   if (!Object.keys(received).length) return;
 
-  let claimedNftId = null;
-  const burn = findNftBurn(receipt);
-  if (burn) claimedNftId = burn.nftId;
+  // burn already computed above; reuse to avoid second receipt scan
+  let claimedNftId = burn?.nftId ?? null;
   if (!claimedNftId) claimedNftId = nftIdFromCalldata(data);
 
   let tier = null;
@@ -1042,6 +1047,41 @@ async function loadHistory() {
     }
   } catch (e) { console.error('[HISTORY mints]', e.message); }
 
+  // (3) v9.29: scan coordinator logs for ALL interactions (BUYs + CLAIMs)
+  // in the last ~2.3 days. Catches CLAIMs from AA wallets that never appear
+  // in Blockscout's direct-TX address history (step 1 only lists tx.to=CONTRACT).
+  // Also catches any direct CLAIMs missed because step 1 is capped at 50 TXs.
+  try {
+    const lp3 = await getLogsProvider();
+    const useLp3 = lp3 || provider;
+    const latestCoord = await useLp3.getBlockNumber();
+    const fromBlockCoord = Math.max(0, latestCoord - 100_000);
+    let coordLogs = [];
+    try {
+      coordLogs = await useLp3.getLogs({
+        address: CONTRACT_LOWER,
+        fromBlock: fromBlockCoord,
+        toBlock: latestCoord,
+      });
+    } catch (e) {
+      console.log(`[HISTORY coord] getLogs err: ${(e.message || '').slice(0, 80)}`);
+    }
+    const coordTxHashes = [...new Set(coordLogs.map(l => l.transactionHash))];
+    console.log(`[HISTORY] ${coordLogs.length} coordinator log -> ${coordTxHashes.length} TX (AA/batched) | son ~2.3 gün`);
+    for (const hash of coordTxHashes) {
+      if (processedTxs.has(hash)) continue;
+      try {
+        const [tx, receipt] = await Promise.all([
+          provider.getTransaction(hash).catch(() => null),
+          provider.getTransactionReceipt(hash).catch(() => null),
+        ]);
+        if (!tx || !receipt) continue;
+        const block = await provider.getBlock(receipt.blockNumber).catch(() => null);
+        await processTx(hash, tx.from, tx.data || '', receipt.blockNumber, block?.timestamp || 0);
+      } catch (_) {}
+    }
+  } catch (e) { console.error('[HISTORY coord]', e.message); }
+
   isLoadingHistory = false;
   const g = ts(1).count - countBefore[1];
   const p = ts(2).count - countBefore[2];
@@ -1070,6 +1110,28 @@ async function scanMintLogs(from, to) {
   }
 }
 
+// v9.29: scan coordinator CONTRACT for any emitted logs in a block range.
+// No topic filter is needed — any event from CONTRACT means a BUY or CLAIM
+// happened (or an admin call, which processTx will silently skip). Returns
+// unique TX hashes. Catches ALL wallet types: standard EOA (tx.to=CONTRACT),
+// Coinbase Smart Wallet / ERC-4337 AA (tx.to=EntryPoint but CONTRACT still
+// emits), and batched / multicall TXs. Replaces the tx.to===CONTRACT block
+// scan which was blind to anything routed through a proxy or bundler.
+async function scanCoordinatorLogs(from, to) {
+  try {
+    const lp = await getLogsProvider();
+    const useLp = lp || provider;
+    const logs = await useLp.getLogs({
+      address: CONTRACT_LOWER,
+      fromBlock: from,
+      toBlock: to,
+    });
+    return [...new Set(logs.map(l => l.transactionHash))];
+  } catch (_) {
+    return [];
+  }
+}
+
 async function pollLoop() {
   let fails = 0;
   console.log('[POLL] Canlı izleme başlıyor...');
@@ -1081,13 +1143,26 @@ async function pollLoop() {
         const from = lastPollBlock + 1;
         const to   = Math.min(cur, lastPollBlock + 20);
 
-        // Direct-to-contract TXs (claims + direct BUYs).
-        const txs  = await scanBlocks(from, to);
-        for (const tx of txs)
-          if (!processedTxs.has(tx.hash))
-            await processTx(tx.hash, tx.from, tx.data, tx.blockNum, tx.blockTs);
+        // v9.29: event-based discovery — catches ALL wallet types.
+        // EOA direct calls, Coinbase Smart Wallet (AA/ERC-4337 via EntryPoint),
+        // batched / multicall — all make CONTRACT emit a log, so getLogs
+        // on CONTRACT finds them regardless of tx.to.
+        const coordTxs = await scanCoordinatorLogs(from, to);
+        for (const hash of coordTxs) {
+          if (processedTxs.has(hash)) continue;
+          try {
+            const [tx, receipt] = await Promise.all([
+              provider.getTransaction(hash).catch(() => null),
+              provider.getTransactionReceipt(hash).catch(() => null),
+            ]);
+            if (!tx || !receipt) continue;
+            const block = await provider.getBlock(receipt.blockNumber).catch(() => null);
+            await processTx(hash, tx.from, tx.data || '', receipt.blockNumber, block?.timestamp || 0);
+          } catch (_) {}
+        }
 
-        // Router-routed BUYs: any mint event from the contract in this range.
+        // Supplementary: NFT contract mint scan — backup for BUYs in case
+        // the coordinator logs RPC lags behind the NFT contract's indexing.
         const mintTxs = await scanMintLogs(from, to);
         for (const hash of mintTxs) {
           if (processedTxs.has(hash)) continue;
