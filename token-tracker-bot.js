@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v9.34';
+const VERSION = 'v9.35';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -278,7 +278,10 @@ function overallAvg(tierNum) {
 }
 
 async function sendNotification(msg) {
-  if (registeredChats.size === 0) return;
+  if (registeredChats.size === 0) {
+    console.log('[NOTIFY] kayıtlı chat yok — bildirim gönderilemiyor. /track ile ekleyin.');
+    return;
+  }
   for (const chatId of registeredChats) {
     try {
       await bot.sendMessage(chatId, msg, { parse_mode: 'HTML', disable_web_page_preview: true });
@@ -1207,31 +1210,40 @@ async function loadHistory() {
 // — the actual NFTs live on a separate contract (auto-detected). Without
 // _nftContractAddr known we can't scan (returns []); the address gets
 // learned on the first BUY/CLAIM processed.
-// v9.32: throws on persistent RPC failure (after fallback) so the caller's
-// outer catch keeps lastPollBlock unchanged — silent [] would lose claims.
+// v9.35: always query main RPC when Blockscout returns empty (not just on
+// throw) — Blockscout eth-rpc silently returns [] for valid ranges on
+// contracts it hasn't indexed well. Union both sources so no TX is missed.
 async function scanMintLogs(from, to) {
   if (!_nftContractAddr) return [];
   const fromZeroTopic = '0x' + '0'.repeat(64);
   const lp = await getLogsProvider();
-  const useLp = lp || provider;
-  try {
-    const logs = await useLp.getLogs({
-      address: _nftContractAddr,
-      topics: [TRANSFER_TOPIC, fromZeroTopic],
-      fromBlock: from, toBlock: to,
-    });
-    return [...new Set(logs.map(l => l.transactionHash))];
-  } catch (e) {
-    if (useLp !== provider) {
-      const logs = await provider.getLogs({
+  const allHashes = new Set();
+  let bsGotResults = false;
+
+  if (lp) {
+    try {
+      const logs = await lp.getLogs({
         address: _nftContractAddr,
         topics: [TRANSFER_TOPIC, fromZeroTopic],
         fromBlock: from, toBlock: to,
       });
-      return [...new Set(logs.map(l => l.transactionHash))];
-    }
-    throw e;
+      for (const l of logs) allHashes.add(l.transactionHash);
+      if (logs.length > 0) bsGotResults = true;
+    } catch (_) {}
   }
+
+  // Always query main RPC if Blockscout had no logs or wasn't available.
+  // Throws on failure so lastPollBlock doesn't advance past unscanned blocks.
+  if (!bsGotResults) {
+    const logs = await provider.getLogs({
+      address: _nftContractAddr,
+      topics: [TRANSFER_TOPIC, fromZeroTopic],
+      fromBlock: from, toBlock: to,
+    });
+    for (const l of logs) allHashes.add(l.transactionHash);
+  }
+
+  return [...allHashes];
 }
 
 // v9.29: scan coordinator CONTRACT for any emitted logs in a block range.
@@ -1239,33 +1251,34 @@ async function scanMintLogs(from, to) {
 // happened (or an admin call, which processTx will silently skip). Returns
 // unique TX hashes. Catches ALL wallet types: standard EOA (tx.to=CONTRACT),
 // Coinbase Smart Wallet / ERC-4337 AA (tx.to=EntryPoint but CONTRACT still
-// emits), and batched / multicall TXs. Replaces the tx.to===CONTRACT block
-// scan which was blind to anything routed through a proxy or bundler.
-// v9.32: now throws on persistent RPC failure (after Blockscout->main RPC
-// fallback) so pollLoop's outer catch can keep lastPollBlock from advancing
-// past unscanned blocks. Previously a silent [] meant claims in those
-// blocks were lost forever.
+// emits), and batched / multicall TXs.
+// v9.35: always query main RPC when Blockscout returns empty (not just on
+// throw). Blockscout eth-rpc was silently returning [] for valid block ranges
+// — the old exception-only fallback meant lastPollBlock advanced past those
+// blocks, permanently losing any claims in them. Now: try Blockscout, and if
+// it returns 0 logs (OR wasn't available), also query main RPC and union the
+// results. Throws only if main RPC fails, so lastPollBlock stays put.
 async function scanCoordinatorLogs(from, to) {
   const lp = await getLogsProvider();
-  const useLp = lp || provider;
-  try {
-    const logs = await useLp.getLogs({
-      address: CONTRACT_LOWER,
-      fromBlock: from,
-      toBlock: to,
-    });
-    return [...new Set(logs.map(l => l.transactionHash))];
-  } catch (e) {
-    if (useLp !== provider) {
-      const logs = await provider.getLogs({
-        address: CONTRACT_LOWER,
-        fromBlock: from,
-        toBlock: to,
-      });
-      return [...new Set(logs.map(l => l.transactionHash))];
-    }
-    throw e;
+  const allHashes = new Set();
+  let bsGotResults = false;
+
+  if (lp) {
+    try {
+      const logs = await lp.getLogs({ address: CONTRACT_LOWER, fromBlock: from, toBlock: to });
+      for (const l of logs) allHashes.add(l.transactionHash);
+      if (logs.length > 0) bsGotResults = true;
+    } catch (_) {}
   }
+
+  // Query main RPC when Blockscout had no logs or wasn't available.
+  // Throws on failure → pollLoop catch fires → lastPollBlock unchanged.
+  if (!bsGotResults) {
+    const logs = await provider.getLogs({ address: CONTRACT_LOWER, fromBlock: from, toBlock: to });
+    for (const l of logs) allHashes.add(l.transactionHash);
+  }
+
+  return [...allHashes];
 }
 
 // v9.32: fetch tx + receipt + block with retries. The per-TX RPC calls in
@@ -1442,6 +1455,7 @@ async function main() {
   });
 
   bot.onText(/\/komut/, async (msg) => {
+    registeredChats.add(String(msg.chat.id));
     const lines = [
       `📋 <b>Komut Listesi</b> ${VERSION}`,
       '',
@@ -1473,6 +1487,7 @@ async function main() {
 
   bot.onText(/\/diag (.+)/, async (msg, match) => {
     const chatId = msg.chat.id;
+    registeredChats.add(String(chatId));
     const txHash = match[1].trim();
     await bot.sendMessage(chatId, `🔍 Analiz ediliyor...`);
     const report = await diagnoseTx(txHash);
@@ -1501,6 +1516,10 @@ async function main() {
   console.log(`[${VERSION}] Contract: ${CONTRACT}`);
   console.log(`[${VERSION}] green=$1 döngü=${SC1_TARGET} | purple=$5 döngü=${SC5_TARGET}`);
   console.log(`[${VERSION}] BOT_START_TS=${BOT_START_TS} LIVE_WINDOW_SEC=${LIVE_WINDOW_SEC} CG_KEY=${COINGECKO_KEY ? 'yes' : 'no'}`);
+  console.log(`[${VERSION}] Kayıtlı chat: ${registeredChats.size} | CHANNEL_ID=${CHANNEL_ID || 'YOK — /track ile ekleyin'}`);
+  if (registeredChats.size === 0) {
+    console.log(`[UYARI] Hiç kayıtlı chat yok! Telegram'dan /track veya /test gönderin.`);
+  }
 
   // v9.31: start live polling immediately with no history preload.
   lastPollBlock = 0;
