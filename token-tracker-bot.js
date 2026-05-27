@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v10.0';
+const VERSION = 'v10.1';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -320,15 +320,25 @@ function findNftBurn(receipt) {
   return null;
 }
 
-// v10.0: Extract tier (1/2/3) from coordinator BUY event or NFT contract
-// custom event topics. Uses minted NFT IDs as an exclusion set to avoid
-// misidentifying a tokenId of 1-3 as a tier value. Scans all indexed
-// topics (topic[1..N]) of both event types looking for a value in {1,2,3}
-// that doesn't match a known minted NFT ID.
+// v10.1: tier is param[1] in BUY function calldata.
+// Function: buy(uint64 batchId, uint8 tier, uint256 seed, uint256 nonce, uint256 deadline)
+// Selector : 0x3e29984c
+// param[0] batchId → data[10:74]
+// param[1] tier    → data[74:138]   ← 1=mavi 2=yeşil 3=mor
+function tierFromCalldata(data) {
+  if (!data || data.length < 138) return null;
+  try {
+    const val = Number(BigInt('0x' + data.slice(74, 138)));
+    if (val >= 1 && val <= 3) return val;
+  } catch (_) {}
+  return null;
+}
+
+// Fallback: scan coordinator BUY event / NFT custom event topics for a
+// value in {1,2,3} that isn't a known minted NFT ID. Used only when
+// calldata is unavailable (e.g. very old recovery TXs).
 function findBuyTierFromLogs(receipt, mintedNftIds) {
   const nftIdSet = new Set((mintedNftIds || []).map(id => BigInt(id)));
-
-  // Primary: coordinator BUY event (topics=4, prefix 0x22e804d3)
   for (const log of receipt.logs) {
     if (log.address.toLowerCase() !== CONTRACT_LOWER) continue;
     if (!log.topics[0]?.toLowerCase().startsWith(BUY_EVENT_PREFIX)) continue;
@@ -339,8 +349,6 @@ function findBuyTierFromLogs(receipt, mintedNftIds) {
       } catch (_) {}
     }
   }
-
-  // Fallback: NFT contract custom event (topics=3, prefix 0x73c1e608)
   for (const log of receipt.logs) {
     if (_nftContractAddr && log.address.toLowerCase() !== _nftContractAddr) continue;
     if (!log.topics[0]?.toLowerCase().startsWith(NFT_CUSTOM_PREFIX)) continue;
@@ -351,7 +359,6 @@ function findBuyTierFromLogs(receipt, mintedNftIds) {
       } catch (_) {}
     }
   }
-
   return null;
 }
 
@@ -482,10 +489,13 @@ async function recoverTierFromBuyTx(nftId) {
     const found = await findMintTxHash(nftId);
     if (!found) { console.log(`[RECOVER fail] nft=${nftId}: mint TX bulunamadı`); return null; }
     const { hash: buyTxHash, src: lookupSrc } = found;
-    const buyReceipt = await provider.getTransactionReceipt(buyTxHash);
+    const [buyTx, buyReceipt] = await Promise.all([
+      provider.getTransaction(buyTxHash).catch(() => null),
+      provider.getTransactionReceipt(buyTxHash).catch(() => null),
+    ]);
     if (!buyReceipt) { console.log(`[RECOVER fail] nft=${nftId}: receipt yok`); return null; }
     const allMints = findAllNftMints(buyReceipt);
-    const tier = findBuyTierFromLogs(buyReceipt, allMints.map(m => m.nftId));
+    const tier = tierFromCalldata(buyTx?.data || '') ?? findBuyTierFromLogs(buyReceipt, allMints.map(m => m.nftId));
     if (tier) {
       const block = await provider.getBlock(buyReceipt.blockNumber).catch(() => null);
       for (const m of allMints) {
@@ -540,11 +550,14 @@ async function ensureRecentTiers() {
       let registered = 0;
       for (const hash of allHashes) {
         try {
-          const receipt = await provider.getTransactionReceipt(hash).catch(() => null);
+          const [tx, receipt] = await Promise.all([
+            provider.getTransaction(hash).catch(() => null),
+            provider.getTransactionReceipt(hash).catch(() => null),
+          ]);
           if (!receipt || receipt.status !== 1) continue;
           const mints = findAllNftMints(receipt);
           if (!mints.length) continue;
-          const tier = findBuyTierFromLogs(receipt, mints.map(m => m.nftId));
+          const tier = tierFromCalldata(tx?.data || '') ?? findBuyTierFromLogs(receipt, mints.map(m => m.nftId));
           if (!tier) continue;
           const block = await provider.getBlock(receipt.blockNumber).catch(() => null);
           for (const m of mints) {
@@ -662,11 +675,12 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
 
   rememberNftContract(receipt);
 
-  // v10.0: BUY TX — detect tier from coordinator event topics, register in map
+  // v10.1: BUY TX — detect tier from calldata param[1] (primary), then
+  // fall back to coordinator/NFT event topics if calldata unavailable.
   const allMints = findAllNftMints(receipt);
   if (allMints.length) {
     const mintedIds = allMints.map(m => m.nftId);
-    const tier = findBuyTierFromLogs(receipt, mintedIds);
+    const tier = tierFromCalldata(data) ?? findBuyTierFromLogs(receipt, mintedIds);
     if (tier) {
       for (const m of allMints) {
         nftToTier.set(m.nftId, { tier, buyer: m.to, buyTxHash: txHash, buyTs: blockTs });
@@ -1094,8 +1108,12 @@ async function main() {
   bot.on('polling_error', (e) => {
     if (e.message?.includes('409')) {
       pollingErrCount++;
-      if (pollingErrCount === 1) console.error('[TG] 409 Conflict — başka bir instance aktif!');
-      if (pollingErrCount > 80) process.exit(1);
+      console.error(`[TG] 409 Conflict #${pollingErrCount} — başka bir instance aktif! Railway'de eski deployment durdur.`);
+      // Exit after 5 repeated 409s so Railway restarts cleanly
+      if (pollingErrCount >= 5) {
+        console.error('[TG] 409 limit aşıldı — process sonlandırılıyor.');
+        process.exit(1);
+      }
     } else {
       pollingErrCount = 0;
       console.error('[TG polling]', e.message);
