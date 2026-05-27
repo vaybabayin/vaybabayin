@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v10.1';
+const VERSION = 'v10.2';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -748,15 +748,23 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
   const txUrl      = `https://basescan.org/tx/${txHash}`;
   const cycleSlice = state.history.slice(0, posInCycle);
   const cycleAvg   = cycleSlice.reduce((s, c) => s + c.usd, 0) / (cycleSlice.length || 1);
-  const avgLine    = [5, 10, 15, 20, 25, 50, 100, 200]
-    .map(n => { const v = calcAvg(state.history, n); return v !== null ? `Avg${n} $${v.toFixed(2)}` : null; })
-    .filter(Boolean).join(' | ');
-  const sEmoji = state.streakDir === 'down' ? '🔴' : '🟢';
+
+  // Show avg(5,10,15,20,25,50,100,200) for all 3 tiers on every notification
+  const AVG_NS = [5, 10, 15, 20, 25, 50, 100, 200];
+  const allAvgLines = [1, 2, 3].map(t => {
+    const tState = ts(t);
+    const tInfo  = TIER_INFO[t];
+    const avgs = AVG_NS
+      .map(n => { const v = calcAvg(tState.history, n); return v !== null ? `Avg${n}:$${v.toFixed(2)}` : null; })
+      .filter(Boolean).join(' | ');
+    return avgs ? `${tInfo.emoji} ${avgs}` : null;
+  }).filter(Boolean).join('\n');
+
   const msg = [
     `${tierInfo.emoji} Total Value: $${totalUsd.toFixed(2)} [${tierInfo.name}]`,
     `📍 Döngü: ${posInCycle}/${cycleSize} (~${remaining} kaldı) — Döngü Avg: $${cycleAvg.toFixed(2)}`,
-    `${sEmoji} Streak: ${state.streak}`,
-    avgLine ? `📊 ${avgLine}` : null,
+    `🔴 Streak: ${state.streak}`,
+    allAvgLines || null,
     `👤 ${claimer}`,
     `🕐 ${date} | <a href="${txUrl}">TX</a>`,
   ].filter(Boolean).join('\n');
