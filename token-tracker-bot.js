@@ -3,12 +3,13 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v9.36';
+const VERSION = 'v10.0';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
 const SC1_TARGET    = parseInt(process.env.SC1_TARGET || '200');
-const SC5_TARGET    = parseInt(process.env.SC5_TARGET || '100');
+const SC2_TARGET    = parseInt(process.env.SC2_TARGET || '200');
+const SC3_TARGET    = parseInt(process.env.SC3_TARGET || '200');
 const COINGECKO_KEY = process.env.COINGECKO_API_KEY || '';
 
 if (!TELEGRAM_TOKEN) { console.error('TELEGRAM_BOT_TOKEN eksik!'); process.exit(1); }
@@ -17,11 +18,8 @@ const CONTRACT_LOWER = CONTRACT.toLowerCase();
 const ZERO_ADDRESS   = '0x0000000000000000000000000000000000000000';
 const USDC_LOWER     = '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913';
 
-// TXs timestamped within this many seconds of bot start are treated as
-// "live" even when encountered during history loading, so they still fire
-// a Telegram notification instead of being silently absorbed.
 const BOT_START_TS    = Math.floor(Date.now() / 1000);
-const LIVE_WINDOW_SEC = 300; // 5 minutes
+const LIVE_WINDOW_SEC = 300;
 
 const registeredChats = new Set();
 if (CHANNEL_ID) registeredChats.add(String(CHANNEL_ID));
@@ -36,13 +34,21 @@ const RPCS = [
   'https://base.blockscout.com/api/eth-rpc',
 ].filter(Boolean);
 
+// v10.0: 3 tiers, all $1 USDC. Tier encoded in coordinator BUY event topics.
 const TIER_INFO = {
-  1: { name: 'green',  emoji: '\u{1F7E2}', payUsd: 1, target: SC1_TARGET },
-  2: { name: 'purple', emoji: '\u{1F7E3}', payUsd: 5, target: SC5_TARGET },
+  1: { name: 'mavi',  emoji: '🔵', payUsd: 1, target: SC1_TARGET },
+  2: { name: 'yeşil', emoji: '🟢', payUsd: 1, target: SC2_TARGET },
+  3: { name: 'mor',   emoji: '🟣', payUsd: 1, target: SC3_TARGET },
 };
 const PER_TOKEN_MAX_USD = 100;
 
-const TRANSFER_TOPIC   = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+const TRANSFER_TOPIC    = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+// Coordinator event sig prefixes (first 8 bytes of topic[0])
+const BUY_EVENT_PREFIX   = '0x22e804d3';
+const CLAIM_EVENT_PREFIX = '0xd7fd12e8';
+// NFT contract custom event seen in logs (0x73c1e6085df115c7...)
+const NFT_CUSTOM_PREFIX  = '0x73c1e608';
+
 const CHAINLINK_ETHUSD = '0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70';
 const WETH             = '0x4200000000000000000000000000000000000006';
 const USDC             = '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913';
@@ -58,7 +64,6 @@ function ts(tier) {
 }
 
 const nftToTier = new Map();
-
 const conversations = {};
 let processedTxs = new Set();
 let pollingErrCount = 0;
@@ -69,9 +74,6 @@ let ethPrice = 0, ethPriceAt = 0;
 let lastPollBlock = 0;
 let isLoadingHistory = false;
 let _recentTiersPromise = null;
-// v9.27: the NFT itself lives on a separate contract (e.g. 0x154dacde...)
-// while CONTRACT is just the coordinator. Auto-detect from the first
-// mint/burn we see; optionally bootstrap from NFT_CONTRACT env.
 let _nftContractAddr = (process.env.NFT_CONTRACT || '').toLowerCase() || null;
 
 async function getProvider() {
@@ -117,11 +119,6 @@ async function getTokenInfo(address) {
   return tokenInfoCache[k];
 }
 
-// CoinGecko Simple Price API on Base. Returns null on miss/error.
-// Pro key (CG-...) auto-selects pro-api.coingecko.com.
-// v9.20: always retry once after 1.5s when the first attempt returns null.
-// Covers both 429 rate-limits AND the empty-200 bodies CoinGecko sometimes
-// returns when polled too quickly.
 async function cgPrice(address) {
   const isPro = COINGECKO_KEY && COINGECKO_KEY.startsWith('CG-');
   const host  = isPro ? 'https://pro-api.coingecko.com' : 'https://api.coingecko.com';
@@ -132,25 +129,20 @@ async function cgPrice(address) {
     if (isPro) headers['x-cg-pro-api-key'] = COINGECKO_KEY;
     else       headers['x-cg-demo-api-key'] = COINGECKO_KEY;
   }
-
   const fetchOnce = async () => {
     try {
       const r = await axios.get(url, { params, headers, timeout: 6000 });
       const obj = r.data?.[address.toLowerCase()];
       const p = obj?.usd;
       return typeof p === 'number' && p > 0 && p < 1e9 ? p : null;
-    } catch (_) {
-      return null;
-    }
+    } catch (_) { return null; }
   };
-
   const first = await fetchOnce();
   if (first) return first;
   await new Promise(r => setTimeout(r, 1500));
   return await fetchOnce();
 }
 
-// DexScreener — pick highest-USD-liquidity Base pair (not just pairs[0]).
 async function dsPrice(address) {
   try {
     const r = await axios.get(`https://api.dexscreener.com/latest/dex/tokens/${address}`, { timeout: 8000 });
@@ -161,13 +153,9 @@ async function dsPrice(address) {
       .sort((a, b) => b.liq - a.liq);
     if (!pairs.length) return null;
     return pairs[0].price;
-  } catch (_) {
-    return null;
-  }
+  } catch (_) { return null; }
 }
 
-// Uniswap V3 on Base — try every fee tier on USDC and WETH, pick the pool
-// with the highest in-range liquidity (instead of "first found wins").
 async function uniPrice(address, decimals) {
   const k = address.toLowerCase();
   const uniFactory = new ethers.Contract(UNI_FACTORY,
@@ -196,7 +184,6 @@ async function uniPrice(address, decimals) {
   return best.price > 0 ? best.price : null;
 }
 
-// Aerodrome V2 — pick deepest pool by reserves * price.
 async function aeroPrice(address, decimals) {
   const k = address.toLowerCase();
   try {
@@ -225,44 +212,24 @@ async function aeroPrice(address, decimals) {
       }
     }
     return best.price > 0 ? best.price : null;
-  } catch (_) {
-    return null;
-  }
+  } catch (_) { return null; }
 }
 
 async function getTokenPriceUsd(address) {
   const k = address.toLowerCase();
   const cached = priceCache[k];
   if (cached && Date.now() - cached.at < 60_000) return cached.price;
-
-  // v9.28: WETH price comes from Chainlink ETH/USD directly — no need to
-  // bounce through CoinGecko/DexScreener (which can rate-limit) and the
-  // on-chain feed is the most authoritative reference for ETH price.
   if (k === WETH_LOWER) {
     const eth = await getEthUsd();
-    if (eth) {
-      priceCache[k] = { price: eth, at: Date.now(), src: 'chainlink' };
-      return eth;
-    }
+    if (eth) { priceCache[k] = { price: eth, at: Date.now(), src: 'chainlink' }; return eth; }
   }
-
   const { decimals } = await getTokenInfo(address);
-
-  // Source order (most reliable first):
-  //   1. CoinGecko Simple Price (curated, deep-liquidity reference price)
-  //   2. DexScreener best-liquidity Base pair (aggregator, USD-quoted)
-  //   3. Uniswap V3 on-chain — pick deepest pool across all fee tiers
-  //   4. Aerodrome V2 on-chain — pick deepest pool
   let price = null, src = null;
-  price = await cgPrice(address);                          if (price) src = 'cg';
-  if (!price) { price = await dsPrice(address);            if (price) src = 'ds'; }
-  if (!price) { price = await uniPrice(address, decimals); if (price) src = 'uni'; }
+  price = await cgPrice(address);                           if (price) src = 'cg';
+  if (!price) { price = await dsPrice(address);             if (price) src = 'ds'; }
+  if (!price) { price = await uniPrice(address, decimals);  if (price) src = 'uni'; }
   if (!price) { price = await aeroPrice(address, decimals); if (price) src = 'aero'; }
-
-  if (price) {
-    priceCache[k] = { price, at: Date.now(), src };
-    return price;
-  }
+  if (price) { priceCache[k] = { price, at: Date.now(), src }; return price; }
   return null;
 }
 
@@ -294,9 +261,6 @@ async function sendNotification(msg) {
   }
 }
 
-// v9.27: detect NFT contract address from any ERC-721 mint or burn event
-// in the receipt, then cache. Called from processTx so subsequent log
-// queries (scanMintLogs / findMintTxOnchain) hit the right address.
 function rememberNftContract(receipt) {
   if (_nftContractAddr) return;
   for (const log of receipt.logs) {
@@ -307,18 +271,12 @@ function rememberNftContract(receipt) {
     if (f === ZERO_ADDRESS || t === ZERO_ADDRESS) {
       _nftContractAddr = log.address.toLowerCase();
       console.log(`[NFT contract] tespit edildi: ${_nftContractAddr}`);
-      // v9.34: kick off background tier scan now that we know the NFT contract.
-      // Any later recovery call will await the same in-flight promise.
       ensureRecentTiers().catch(() => {});
       return;
     }
   }
 }
 
-// v9.27: accept ERC-721 mints from any address — the NFT contract is
-// separate from CONTRACT (the coordinator). If we've already learned the
-// NFT contract, restrict to it so we don't pick up unrelated NFT mints
-// that happen to share the same TX.
 function findNftMint(receipt) {
   for (const log of receipt.logs) {
     if (log.topics[0]?.toLowerCase() !== TRANSFER_TOPIC) continue;
@@ -362,10 +320,41 @@ function findNftBurn(receipt) {
   return null;
 }
 
-// v9.27: USDC is paid to a treasury (e.g. 0x553ef3e2...), not to CONTRACT,
-// so don't constrain the recipient — sum every USDC outflow from the payer
-// in this TX. This catches the full price even if it's split across
-// multiple internal transfers.
+// v10.0: Extract tier (1/2/3) from coordinator BUY event or NFT contract
+// custom event topics. Uses minted NFT IDs as an exclusion set to avoid
+// misidentifying a tokenId of 1-3 as a tier value. Scans all indexed
+// topics (topic[1..N]) of both event types looking for a value in {1,2,3}
+// that doesn't match a known minted NFT ID.
+function findBuyTierFromLogs(receipt, mintedNftIds) {
+  const nftIdSet = new Set((mintedNftIds || []).map(id => BigInt(id)));
+
+  // Primary: coordinator BUY event (topics=4, prefix 0x22e804d3)
+  for (const log of receipt.logs) {
+    if (log.address.toLowerCase() !== CONTRACT_LOWER) continue;
+    if (!log.topics[0]?.toLowerCase().startsWith(BUY_EVENT_PREFIX)) continue;
+    for (let i = 1; i < log.topics.length; i++) {
+      try {
+        const val = BigInt(log.topics[i]);
+        if (val >= 1n && val <= 3n && !nftIdSet.has(val)) return Number(val);
+      } catch (_) {}
+    }
+  }
+
+  // Fallback: NFT contract custom event (topics=3, prefix 0x73c1e608)
+  for (const log of receipt.logs) {
+    if (_nftContractAddr && log.address.toLowerCase() !== _nftContractAddr) continue;
+    if (!log.topics[0]?.toLowerCase().startsWith(NFT_CUSTOM_PREFIX)) continue;
+    for (let i = 1; i < log.topics.length; i++) {
+      try {
+        const val = BigInt(log.topics[i]);
+        if (val >= 1n && val <= 3n && !nftIdSet.has(val)) return Number(val);
+      } catch (_) {}
+    }
+  }
+
+  return null;
+}
+
 function findUsdcPayment(receipt, payer) {
   let total = 0n;
   for (const log of receipt.logs) {
@@ -380,22 +369,7 @@ function findUsdcPayment(receipt, payer) {
   return Number(total) / 1e6;
 }
 
-function classifyByUsdc(usdAmount) {
-  if (usdAmount >= 0.5 && usdAmount < 2.5) return 1;
-  if (usdAmount >= 2.5 && usdAmount < 10) return 2;
-  return null;
-}
-
-// v9.22: find the mint TX hash for an NFT — Blockscout first (fast),
-// eth_getLogs fallback (slower but works when Blockscout doesn't index
-// the token or the mint is outside the default page).
-// v9.23: silenced per-call 404 logs (Blockscout doesn't index this
-// contract's instances at all, so every call 404s — noisy). First
-// getLogs failure is logged once per process so RPC problems are
-// still visible.
 let _bsInstancesDisabled = false;
-let _getLogsErrLogged    = false;
-
 async function findMintTxBlockscout(nftId) {
   if (_bsInstancesDisabled) return null;
   try {
@@ -405,26 +379,17 @@ async function findMintTxBlockscout(nftId) {
     const items = r.data?.items || [];
     for (const t of items) {
       const fromHash = (t.from?.hash || t.from || '').toLowerCase();
-      if (fromHash === ZERO_ADDRESS) {
-        return t.transaction_hash || t.tx_hash || t.hash || null;
-      }
+      if (fromHash === ZERO_ADDRESS) return t.transaction_hash || t.tx_hash || t.hash || null;
     }
   } catch (e) {
     if (e.response?.status === 404 && !_bsInstancesDisabled) {
       _bsInstancesDisabled = true;
-      console.log(`[BS instances] 404 for nft=${nftId} — contract not indexed as token instances; disabling this lookup for the session.`);
-    } else if (e.response?.status !== 404) {
-      console.log(`[BS instances] nft=${nftId}: ${(e.message || '').slice(0, 60)}`);
+      console.log(`[BS instances] 404 — disabled for session`);
     }
   }
   return null;
 }
 
-// v9.24: dedicated provider for log queries — Blockscout's eth-rpc
-// endpoint, used as primary because it doesn't rate-limit topic-filtered
-// queries the way mainnet.base.org does. v9.25 also keeps a fallback
-// against the main provider with smaller chunks, since Blockscout's RPC
-// sometimes returns empty for contracts it hasn't indexed as a token.
 let _logsProvider     = null;
 let _logsProviderTried = false;
 async function getLogsProvider() {
@@ -446,10 +411,6 @@ async function getLogsProvider() {
   }
 }
 
-// v9.25: scan a bounded window backwards from the most recent block via
-// chunked getLogs. Tries Blockscout's logs RPC first (no rate limit but
-// sometimes returns empty for unindexed contracts), then falls back to
-// the main provider with delays between chunks.
 async function _scanLogsForMint(rpcLabel, lp, queryAddr, tokenIdHex, fromZeroTopic, latest, maxLookback, chunk, delayMs) {
   let chunksTried = 0, chunksFailed = 0;
   for (let offset = 0; offset < maxLookback; offset += chunk) {
@@ -469,27 +430,19 @@ async function _scanLogsForMint(rpcLabel, lp, queryAddr, tokenIdHex, fromZeroTop
       }
     } catch (e) {
       chunksFailed++;
-      if (chunksFailed === 1) {
-        console.log(`[${rpcLabel} err] first chunk failed: ${(e.message || '').slice(0, 80)}`);
-      }
+      if (chunksFailed === 1) console.log(`[${rpcLabel} err] ${(e.message || '').slice(0, 80)}`);
     }
     if (fromBlock === 0) break;
     if (delayMs) await new Promise(r => setTimeout(r, delayMs));
   }
-  console.log(`[${rpcLabel} miss] no mint event in ${chunksTried} chunks (failed=${chunksFailed})`);
   return null;
 }
 
 async function findMintTxOnchain(nftId) {
-  if (!_nftContractAddr) {
-    console.log(`[mint scan skip] nft=${nftId}: NFT contract bilinmiyor (henüz claim/buy görülmedi)`);
-    return null;
-  }
+  if (!_nftContractAddr) return null;
   const tokenIdHex    = '0x' + BigInt(nftId).toString(16).padStart(64, '0');
   const fromZeroTopic = '0x' + '0'.repeat(64);
   const queryAddr     = _nftContractAddr;
-
-  // Try Blockscout RPC first — wide single chunk (it doesn't rate-limit).
   const lp = await getLogsProvider();
   if (lp) {
     try {
@@ -497,26 +450,16 @@ async function findMintTxOnchain(nftId) {
       const logs = await lp.getLogs({
         address: queryAddr,
         topics: [TRANSFER_TOPIC, fromZeroTopic, null, tokenIdHex],
-        fromBlock: Math.max(0, latest - 1_500_000),  // ~35 days on Base
+        fromBlock: Math.max(0, latest - 1_500_000),
         toBlock: latest,
       });
-      if (logs.length) {
-        console.log(`[blockscoutRPC hit] nft=${nftId} mint @ block=${logs[0].blockNumber}`);
-        return logs[0].transactionHash;
-      }
-      console.log(`[blockscoutRPC miss] nft=${nftId} wide scan returned 0 logs — falling back to main RPC`);
-    } catch (e) {
-      console.log(`[blockscoutRPC err] nft=${nftId}: ${(e.message || '').slice(0, 80)} — falling back to main RPC`);
-    }
+      if (logs.length) return logs[0].transactionHash;
+    } catch (_) {}
   }
-
-  // Fallback: main provider in 9999-block chunks with 250ms delay.
   try {
     const latest = await provider.getBlockNumber();
     return await _scanLogsForMint('mainRPC', provider, queryAddr, tokenIdHex, fromZeroTopic, latest, 200_000, 9999, 250);
-  } catch (e) {
-    console.log(`[mainRPC scan err] nft=${nftId}: ${(e.message || '').slice(0, 80)}`);
-  }
+  } catch (_) {}
   return null;
 }
 
@@ -528,58 +471,29 @@ async function findMintTxHash(nftId) {
   return null;
 }
 
-// v9.22: recover NFT → tier mapping from the chain when not in memory
-// (e.g. after a bot restart, or when the BUY happened outside the history
-// window). Handles multi-mint TXs: when a buyer mints N cards in one BUY,
-// per-card price = totalUsdcPaid / N (so 5×$1 doesn't get misclassified
-// as $5 = purple). Registers ALL minted NFTs from that BUY TX, not just
-// the one being recovered — future claims for siblings will hit the map.
 async function recoverTierFromBuyTx(nftId) {
-  // v9.33: scan all recent BUY TXs first (one getLogs call, much faster /
-  // more reliable than per-token-ID 4-topic filter scans). After this, the
-  // nftToTier map has every card bought in the last ~5 hours.
   await ensureRecentTiers();
   if (nftToTier.has(nftId)) {
     const info = nftToTier.get(nftId);
-    console.log(`[RECOVER cache] nft=${nftId} tier=${info.tier} (${TIER_INFO[info.tier].name})`);
+    console.log(`[RECOVER cache] nft=${nftId} tier=${info.tier} (${TIER_INFO[info.tier]?.name})`);
     return info.tier;
   }
-
   try {
     const found = await findMintTxHash(nftId);
-    if (!found) {
-      console.log(`[RECOVER fail] nft=${nftId}: mint TX not found via Blockscout or RPC`);
-      return null;
-    }
+    if (!found) { console.log(`[RECOVER fail] nft=${nftId}: mint TX bulunamadı`); return null; }
     const { hash: buyTxHash, src: lookupSrc } = found;
-
     const buyReceipt = await provider.getTransactionReceipt(buyTxHash);
-    if (!buyReceipt) {
-      console.log(`[RECOVER fail] nft=${nftId}: no receipt for ${buyTxHash.slice(0,10)}`);
-      return null;
-    }
-
+    if (!buyReceipt) { console.log(`[RECOVER fail] nft=${nftId}: receipt yok`); return null; }
     const allMints = findAllNftMints(buyReceipt);
-    if (!allMints.length) {
-      console.log(`[RECOVER fail] nft=${nftId}: no mints in ${buyTxHash.slice(0,10)}`);
-      return null;
-    }
-
-    const mintForThis = allMints.find(m => m.nftId === String(nftId)) || allMints[0];
-    const usdPaid     = findUsdcPayment(buyReceipt, mintForThis.to);
-    const perCard     = usdPaid / allMints.length;
-    const tier        = classifyByUsdc(perCard);
-
+    const tier = findBuyTierFromLogs(buyReceipt, allMints.map(m => m.nftId));
     if (tier) {
       const block = await provider.getBlock(buyReceipt.blockNumber).catch(() => null);
-      const buyTs = block?.timestamp || 0;
-      // Register every minted NFT in this BUY TX so sibling claims also hit.
       for (const m of allMints) {
-        nftToTier.set(m.nftId, { tier, buyer: m.to, buyTxHash, buyTs });
+        nftToTier.set(m.nftId, { tier, buyer: m.to, buyTxHash, buyTs: block?.timestamp || 0 });
       }
-      console.log(`[RECOVER ${lookupSrc}] nft=${nftId} tier=${tier} (${TIER_INFO[tier].name}) totalPaid=$${usdPaid.toFixed(2)} mints=${allMints.length} perCard=$${perCard.toFixed(2)} from ${buyTxHash.slice(0,10)}`);
+      console.log(`[RECOVER ${lookupSrc}] nft=${nftId} tier=${tier} (${TIER_INFO[tier]?.name}) from ${buyTxHash.slice(0,10)}`);
     } else {
-      console.log(`[RECOVER no-tier ${lookupSrc}] nft=${nftId}: found BUY ${buyTxHash.slice(0,10)} but perCard=$${perCard.toFixed(2)} (totalPaid=$${usdPaid.toFixed(2)} mints=${allMints.length}) — not $1 / $5`);
+      console.log(`[RECOVER no-tier] nft=${nftId}: BUY TX'te tier bilgisi yok ${buyTxHash.slice(0,10)}`);
     }
     return tier;
   } catch (e) {
@@ -588,13 +502,6 @@ async function recoverTierFromBuyTx(nftId) {
   }
 }
 
-// v9.33+v9.34: scan recent BUY TXs and populate nftToTier with their tier
-// info. Concurrent callers share one in-flight scan via _recentTiersPromise.
-// Strategy: union TX hashes from BOTH the NFT contract's mint events AND
-// the coordinator's event logs, falling back to main RPC if Blockscout
-// returns empty / errors. This redundancy is essential because the
-// Blockscout eth-rpc sometimes returns 0 logs for valid block ranges on
-// contracts it hasn't indexed well — silently breaking tier recovery.
 async function ensureRecentTiers() {
   if (_recentTiersPromise) return _recentTiersPromise;
   if (!_nftContractAddr) return;
@@ -618,13 +525,10 @@ async function ensureRecentTiers() {
         }
       };
 
-      // Pass 1: try Blockscout for both endpoints in parallel
       const [n1, n2] = await Promise.all([
         tryGetLogs(useLp, { address: _nftContractAddr, topics: [TRANSFER_TOPIC, fromZeroTopic], fromBlock, toBlock: latest }, 'bs-mint'),
         tryGetLogs(useLp, { address: CONTRACT_LOWER, fromBlock, toBlock: latest }, 'bs-coord'),
       ]);
-
-      // Pass 2: if Blockscout returned empty/errored on either, retry on main RPC
       if (useLp !== provider && (n1 <= 0 || n2 <= 0)) {
         await Promise.all([
           n1 <= 0 ? tryGetLogs(provider, { address: _nftContractAddr, topics: [TRANSFER_TOPIC, fromZeroTopic], fromBlock, toBlock: latest }, 'main-mint') : null,
@@ -632,8 +536,7 @@ async function ensureRecentTiers() {
         ].filter(Boolean));
       }
 
-      console.log(`[ensureRecentTiers] ${allHashes.size} TX adayı (bs mint=${n1} coord=${n2}) — receipt taranıyor`);
-
+      console.log(`[ensureRecentTiers] ${allHashes.size} TX adayı (bs mint=${n1} coord=${n2})`);
       let registered = 0;
       for (const hash of allHashes) {
         try {
@@ -641,10 +544,7 @@ async function ensureRecentTiers() {
           if (!receipt || receipt.status !== 1) continue;
           const mints = findAllNftMints(receipt);
           if (!mints.length) continue;
-          const firstMint = mints[0];
-          const usdPaid = findUsdcPayment(receipt, firstMint.to);
-          const perCard = usdPaid / mints.length;
-          const tier = classifyByUsdc(perCard);
+          const tier = findBuyTierFromLogs(receipt, mints.map(m => m.nftId));
           if (!tier) continue;
           const block = await provider.getBlock(receipt.blockNumber).catch(() => null);
           for (const m of mints) {
@@ -658,13 +558,11 @@ async function ensureRecentTiers() {
       console.log(`[ensureRecentTiers] tamamlandı — ${registered} yeni tier | map=${nftToTier.size}`);
     } catch (e) {
       console.log(`[ensureRecentTiers] hata: ${(e.message || '').slice(0, 80)}`);
-      _recentTiersPromise = null; // null on error → retry next call
+      _recentTiersPromise = null;
       throw e;
     }
   })();
-  try {
-    await _recentTiersPromise;
-  } catch (_) {}
+  try { await _recentTiersPromise; } catch (_) {}
   return _recentTiersPromise;
 }
 
@@ -675,24 +573,12 @@ function nftIdFromCalldata(data) {
 }
 
 function collectReceived(receipt, recipient) {
-  // Combined collection: both contract-direct transfers (from === CONTRACT)
-  // and mint-to-user events (from === 0x0) count as legitimate scratch card
-  // rewards. Many tiers deliver part of the reward via .transfer() and part
-  // via mint() — taking only one (v9.17) caused under-counting.
-  //
-  // sources[token] tracks where each token's amount came from ('C' = direct
-  // from contract, 'M' = mint to user) so logs / /diag show the breakdown
-  // and pricing oddities are traceable.
-  //
-  // Fallback (fromOther) only activates when neither direct nor mint paths
-  // produced any received tokens — covers router/swap-routed rewards.
   const received = {};
   const sources  = {};
   const fromOther = {};
-
   for (const log of receipt.logs) {
     if (log.topics[0]?.toLowerCase() !== TRANSFER_TOPIC) continue;
-    if (log.topics.length !== 3) continue; // ERC20 only; NFTs use 4 topics
+    if (log.topics.length !== 3) continue;
     const to      = ('0x' + log.topics[2].slice(26)).toLowerCase();
     const fromLog = ('0x' + log.topics[1].slice(26)).toLowerCase();
     if (to !== recipient) continue;
@@ -706,14 +592,9 @@ function collectReceived(receipt, recipient) {
       received[tokenAddr] = (received[tokenAddr] ?? 0n) + amt;
       (sources[tokenAddr] ??= new Set()).add('M');
     } else {
-      // v9.28: previously excluded WETH here as a defensive filter against
-      // internal wrapped-ETH movements, but in this contract WETH is a
-      // legitimate reward paid out by the helper (e.g. 0x4a8c9cf2 paid
-      // 0.000047 WETH ≈ $0.12 that was silently dropped from the total).
       fromOther[tokenAddr] = (fromOther[tokenAddr] ?? 0n) + amt;
     }
   }
-
   if (Object.keys(received).length)
     return { received, usedFallback: false, src: 'mixed', sources };
   return { received: fromOther, usedFallback: true, src: 'other', sources: {} };
@@ -728,10 +609,7 @@ async function calcTotalUsd(received, sources) {
   const addPriced = (addr, info, human, price, label) => {
     const usd = human * price;
     if (usd < 0.0001) return;
-    if (usd > PER_TOKEN_MAX_USD) {
-      droppedSummary.push(`${info.symbol}=$${usd.toFixed(2)}(OUTLIER)`);
-      return;
-    }
+    if (usd > PER_TOKEN_MAX_USD) { droppedSummary.push(`${info.symbol}=$${usd.toFixed(2)}(OUTLIER)`); return; }
     const psrc = priceCache[addr.toLowerCase()]?.src || '?';
     const fsrc = sources && sources[addr] ? Array.from(sources[addr]).sort().join('') : '?';
     totalUsd += usd;
@@ -739,8 +617,7 @@ async function calcTotalUsd(received, sources) {
     tokenDetail.push(`${info.symbol}[${fsrc}] ${human.toFixed(6)} @ $${price.toFixed(8)}[${psrc}${label}] = $${usd.toFixed(4)}`);
   };
 
-  const pending = []; // tokens that returned NO_PRICE on the first pass
-
+  const pending = [];
   for (const [addr, rawAmt] of Object.entries(received)) {
     try {
       const info  = await getTokenInfo(addr);
@@ -751,10 +628,6 @@ async function calcTotalUsd(received, sources) {
     } catch (_) {}
   }
 
-  // v9.20: second pass — retry every NO_PRICE token after a brief delay and
-  // a cache bust. CoinGecko/DexScreener occasionally return empty/429 right
-  // at claim time and recover seconds later; without this, the Telegram total
-  // under-counts (e.g. $0.75) versus what /diag reports a minute later ($1.00).
   if (pending.length) {
     await new Promise(r => setTimeout(r, 2000));
     for (const { addr, info, human } of pending) {
@@ -777,9 +650,6 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
     const arr = [...processedTxs]; processedTxs = new Set(arr.slice(-10000));
   }
 
-  // Is this TX recent enough to treat as live even during history loading?
-  // Covers the case where the bot restarts and a claim that just happened
-  // lands in the 50-TX history window and would otherwise be silently eaten.
   const isRecentTx = blockTs >= BOT_START_TS - LIVE_WINDOW_SEC;
 
   let receipt;
@@ -788,56 +658,36 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
       console.log(`[SKIP rpc-err] ${txHash.slice(0,10)}: ${e.message.slice(0,60)}`);
     return;
   }
-  if (!receipt || receipt.status === 0) {
-    if (!isLoadingHistory || isRecentTx)
-      console.log(`[SKIP receipt] status=${receipt?.status ?? 'null'} | ${txHash.slice(0,10)}`);
-    return;
-  }
+  if (!receipt || receipt.status === 0) return;
 
   rememberNftContract(receipt);
 
-  // v9.29: for AA wallets (Coinbase Smart Wallet / ERC-4337) tx.from is the
-  // bundler, not the actual claimer. The NFT burn event's 'from' is the smart
-  // wallet that burned the card — the same address that receives reward tokens.
-  // Detecting this before collectReceived ensures we filter for the right recipient.
-  // For standard EOA wallets, burn.from === tx.from so behaviour is unchanged.
-  const burn = findNftBurn(receipt);
-  const claimer = burn ? burn.from.toLowerCase() : from.toLowerCase();
-
-  // v9.22: support multi-mint BUY TXs (buyer mints N cards in one TX).
-  // Per-card price = totalUsdcPaid / N. Without this, 5×$1 cards would be
-  // misclassified as a single $5 purple, and siblings of the first NFT would
-  // never get a tier mapping (only the first mint was registered before).
+  // v10.0: BUY TX — detect tier from coordinator event topics, register in map
   const allMints = findAllNftMints(receipt);
   if (allMints.length) {
-    const firstMint = allMints[0];
-    const usdPaid   = findUsdcPayment(receipt, firstMint.to);
-    const perCard   = usdPaid / allMints.length;
-    const tier      = classifyByUsdc(perCard);
+    const mintedIds = allMints.map(m => m.nftId);
+    const tier = findBuyTierFromLogs(receipt, mintedIds);
     if (tier) {
       for (const m of allMints) {
         nftToTier.set(m.nftId, { tier, buyer: m.to, buyTxHash: txHash, buyTs: blockTs });
       }
       if (!isLoadingHistory || isRecentTx)
-        console.log(`[BUY] mints=${allMints.length} tier=${tier} (${TIER_INFO[tier].name}) totalPaid=$${usdPaid.toFixed(2)} perCard=$${perCard.toFixed(2)} buyer=${firstMint.to.slice(0,10)} ids=[${allMints.map(m=>m.nftId).join(',')}] | ${txHash.slice(0,10)}`);
+        console.log(`[BUY] tier=${tier}(${TIER_INFO[tier]?.name}) mints=${allMints.length} ids=[${mintedIds.join(',')}] | ${txHash.slice(0,10)}`);
     } else {
       if (!isLoadingHistory || isRecentTx)
-        console.log(`[BUY ?] mints=${allMints.length} totalPaid=$${usdPaid.toFixed(2)} perCard=$${perCard.toFixed(2)} (tier yok) | ${txHash.slice(0,10)}`);
+        console.log(`[BUY ?] tier bilinmiyor mints=${allMints.length} ids=[${mintedIds.join(',')}] | ${txHash.slice(0,10)}`);
     }
-    return;
+    return; // BUY TX — no notification
   }
 
-  // v9.24: check transfers FIRST. The contract receives many non-claim
-  // calls (admin/setX/approve/transfer) where the first uint256 in calldata
-  // is NOT an NFT id. Extracting it as one and logging `[SKIP no-transfer]
-  // nft=3` floods the log with false positives. If the receipt has no
-  // reward transfer to the caller, it is not a claim — drop silently.
-  const { received, usedFallback, src, sources } = collectReceived(receipt, claimer);
+  // CLAIM TX
+  const burn = findNftBurn(receipt);
+  const claimer = burn ? burn.from.toLowerCase() : from.toLowerCase();
+
+  const { received, src, sources } = collectReceived(receipt, claimer);
   if (!Object.keys(received).length) return;
 
-  // burn already computed above; reuse to avoid second receipt scan
-  let claimedNftId = burn?.nftId ?? null;
-  if (!claimedNftId) claimedNftId = nftIdFromCalldata(data);
+  let claimedNftId = burn?.nftId ?? nftIdFromCalldata(data);
 
   let tier = null;
   if (claimedNftId && nftToTier.has(claimedNftId)) {
@@ -851,31 +701,17 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
     return;
   }
 
-  // v9.21: tier is determined ONLY by the USDC payment in the BUY TX
-  // ($1 = green, $5 = purple). If the in-memory NFT map doesn't have it,
-  // recover by pulling the original mint event from Blockscout and reading
-  // the USDC payment from that receipt. NEVER guess from the won amount —
-  // a green ticket can legitimately win $30+.
-  //
-  // v9.23: only run recovery for live or recent TXs. Old history TXs only
-  // affect stats (no notification fires), so paying the recovery cost for
-  // them stalls startup; the count stays slightly behind for unrecognised
-  // old claims, which is an acceptable trade for fast boot.
   if (tier === null && claimedNftId && (!isLoadingHistory || isRecentTx)) {
     tier = await recoverTierFromBuyTx(claimedNftId);
   }
 
-  if (tier === null) {
-    // v9.36: not a $1 or $5 scratch card — silently skip, no notification, no log spam.
-    // Coordinator emits events for other interactions too; if tier recovery
-    // can't classify it as green or purple it's not a card we track.
-    return;
-  }
+  // v10.0: silently skip if tier can't be determined (not a $1 scratch card)
+  if (tier === null) return;
 
-  const tierInfo = TIER_INFO[tier];
+  const tierInfo  = TIER_INFO[tier];
   const cycleSize = tierInfo.target;
-
   const state = ts(tier);
+
   if (state.history.length > 0) {
     const dir = totalUsd >= state.history[0].usd ? 'up' : 'down';
     state.streak    = dir === state.streakDir ? state.streak + 1 : 1;
@@ -885,12 +721,10 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
   }
 
   state.count++;
-  // Increment sessionCount for live TXs AND for recent TXs found in history.
   if (!isLoadingHistory || isRecentTx) state.sessionCount++;
   state.history.unshift({ usd: totalUsd, ts: blockTs * 1000, hash: txHash, claimer: from });
   if (state.history.length > Math.max(cycleSize, 200)) state.history.pop();
 
-  // Suppress notifications for old history TXs; always notify for live and recent.
   if (isLoadingHistory && !isRecentTx) return;
 
   const pos        = state.sessionCount > 0 ? state.sessionCount : state.count;
@@ -900,30 +734,27 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
   const txUrl      = `https://basescan.org/tx/${txHash}`;
   const cycleSlice = state.history.slice(0, posInCycle);
   const cycleAvg   = cycleSlice.reduce((s, c) => s + c.usd, 0) / (cycleSlice.length || 1);
-  const avgLine    = [5, 10, 15, 20, 50, 100]
+  const avgLine    = [5, 10, 15, 20, 25, 50, 100, 200]
     .map(n => { const v = calcAvg(state.history, n); return v !== null ? `Avg${n} $${v.toFixed(2)}` : null; })
     .filter(Boolean).join(' | ');
   const sEmoji = state.streakDir === 'down' ? '🔴' : '🟢';
   const msg = [
-    `${tierInfo.emoji} Total Value: $${totalUsd.toFixed(2)} [${tierInfo.name} / $${tierInfo.payUsd} USDC]`,
+    `${tierInfo.emoji} Total Value: $${totalUsd.toFixed(2)} [${tierInfo.name}]`,
     `📍 Döngü: ${posInCycle}/${cycleSize} (~${remaining} kaldı) — Döngü Avg: $${cycleAvg.toFixed(2)}`,
     `${sEmoji} Streak: ${state.streak}`,
     avgLine ? `📊 ${avgLine}` : null,
-    `👤 ${from}`,
+    `👤 ${claimer}`,
     `🕐 ${date} | <a href="${txUrl}">TX</a>`,
   ].filter(Boolean).join('\n');
 
-  console.log(`[✓] ${tierInfo.name} won=$${totalUsd.toFixed(2)} nft=${claimedNftId} cyc=${posInCycle}/${cycleSize} src=${src} | ${tokenDetail.join(' || ')} | ${txHash.slice(0,10)}`);
+  console.log(`[✓] ${tierInfo.name} won=$${totalUsd.toFixed(2)} nft=${claimedNftId} cyc=${posInCycle}/${cycleSize} | ${tokenDetail.join(' || ')} | ${txHash.slice(0,10)}`);
   await sendNotification(msg);
 }
 
 async function diagnoseTx(txHash) {
   const lines = [`🔍 TX: <code>${txHash}</code>`];
-  // v9.34: validate format up front so users see a clear error instead of
-  // a raw RPC "invalid string length" when they accidentally paste a
-  // contract address (40 hex chars) instead of a TX hash (64 hex chars).
   if (typeof txHash !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(txHash)) {
-    lines.push(`❌ Geçersiz TX hash. 0x + 64 hex karakter bekleniyor (32 byte). Şu an: ${txHash?.length ?? 0} karakter.`);
+    lines.push(`❌ Geçersiz TX hash. 0x + 64 hex karakter bekleniyor. Şu an: ${txHash?.length ?? 0} karakter.`);
     return lines.join('\n');
   }
   try {
@@ -940,38 +771,25 @@ async function diagnoseTx(txHash) {
     const burn = findNftBurn(receipt);
     if (mint) {
       const all = findAllNftMints(receipt);
+      const mintedIds = all.map(m => m.nftId);
+      const tier = findBuyTierFromLogs(receipt, mintedIds);
       const paid = findUsdcPayment(receipt, mint.to);
-      const perCard = paid / (all.length || 1);
-      const tier = classifyByUsdc(perCard);
-      lines.push(`🛒 BUY TX: ${all.length} mint, totalPaid=$${paid.toFixed(2)}, perCard=$${perCard.toFixed(2)} → tier=${tier ?? '?'}`);
+      lines.push(`🛒 BUY TX: ${all.length} mint, paid=$${paid.toFixed(2)}, tier=${tier ?? '?'}(${TIER_INFO[tier]?.name ?? 'bilinmiyor'})`);
       lines.push(`   NFT id'ler: [${all.map(m => '#'+m.nftId).join(', ')}] → ${mint.to.slice(0,12)}`);
-      if (nftToTier.has(mint.nftId)) lines.push(`  ✓ Map'te: ${JSON.stringify(nftToTier.get(mint.nftId)).slice(0,100)}`);
+      if (tier && nftToTier.has(mint.nftId)) lines.push(`  ✓ Map'te: tier=${tier}`);
     } else if (burn) {
       lines.push(`🔥 CLAIM TX: NFT #${burn.nftId} burn from ${burn.from.slice(0,12)}`);
       if (nftToTier.has(burn.nftId)) {
         const m = nftToTier.get(burn.nftId);
-        lines.push(`  ✓ Map'te tier=${m.tier} (${TIER_INFO[m.tier].name})`);
+        lines.push(`  ✓ Map'te tier=${m.tier} (${TIER_INFO[m.tier]?.name})`);
       } else {
         lines.push(`  ⚠️ NFT #${burn.nftId} map'te yok — fallback'e düşer`);
       }
     } else {
-      const fromCd = nftIdFromCalldata(tx.data || '');
-      lines.push(`❓ Mint/burn yok. Calldata'dan NFT id tahmini: ${fromCd ?? 'n/a'}`);
-      if (fromCd && nftToTier.has(fromCd)) {
-        const m = nftToTier.get(fromCd);
-        lines.push(`  ✓ Map'te tier=${m.tier} (${TIER_INFO[m.tier].name})`);
-      } else if (fromCd) {
-        lines.push(`  🔎 Map'te yok — BUY TX'ten kurtarmaya çalışıyorum...`);
-        const recovered = await recoverTierFromBuyTx(fromCd);
-        if (recovered) {
-          lines.push(`  ✓ Recovered tier=${recovered} (${TIER_INFO[recovered].name})`);
-        } else {
-          lines.push(`  ✗ BUY TX bulunamadı / USDC ödemesi $1 veya $5 değil`);
-        }
-      }
+      lines.push(`❓ Mint/burn yok`);
     }
 
-    const { received, usedFallback, src, sources } = collectReceived(receipt, tx.from.toLowerCase());
+    const { received, src, sources } = collectReceived(receipt, tx.from.toLowerCase());
     lines.push(`💸 Recipient transferi: ${Object.keys(received).length} (src=${src})`);
     if (Object.keys(received).length) {
       const { totalUsd, tokenDetail, droppedSummary } = await calcTotalUsd(received, sources);
@@ -980,281 +798,72 @@ async function diagnoseTx(txHash) {
       lines.push(`💰 Toplam: $${totalUsd.toFixed(4)}`);
     }
 
-    // Full audit: all ERC20 transfers to user, tagged by source
-    const recipient = tx.from.toLowerCase();
-    const allToUser = [];
-    for (const log of receipt.logs) {
-      if (log.topics[0]?.toLowerCase() !== TRANSFER_TOPIC) continue;
-      if (log.topics.length !== 3) continue;
-      const to      = ('0x' + log.topics[2].slice(26)).toLowerCase();
-      const fromLog = ('0x' + log.topics[1].slice(26)).toLowerCase();
-      if (to !== recipient) continue;
-      if (!log.data || log.data === '0x') continue;
-      const tokenAddr = log.address.toLowerCase();
-      try {
-        const info  = await getTokenInfo(tokenAddr);
-        const human = Number(ethers.formatUnits(BigInt(log.data), info.decimals));
-        const tag   = fromLog === CONTRACT_LOWER ? 'CONTRACT'
-                    : fromLog === ZERO_ADDRESS    ? 'MINT'
-                    : `OTHER(${fromLog.slice(0,8)})`;
-        allToUser.push(`${info.symbol} ${human.toFixed(6)} ← ${tag}`);
-      } catch (_) {}
-    }
-    if (allToUser.length) {
-      lines.push(`📥 Tüm transferler (user'a):`);
-      for (const a of allToUser) lines.push(`  • ${a}`);
-    }
-
-    // v9.26: full event dump so we can see what BUY TXs actually emit on
-    // contracts that don't use standard ERC-721 Transfer (where v9.25's
-    // mint scan returns 0). Shows topic count + event signature + emitting
-    // address for every log — enough to reverse-engineer the BUY pattern.
+    // Full event dump — show ALL topics for every event
     lines.push(`\n🧪 Tüm event'ler (${receipt.logs.length} toplam):`);
-    const contractAddr = CONTRACT.toLowerCase();
     for (let i = 0; i < receipt.logs.length; i++) {
       const log = receipt.logs[i];
       const addr = log.address.toLowerCase();
-      const tag  = addr === contractAddr ? '⭐CONTRACT' : addr === USDC_LOWER ? '💵USDC' : `${addr.slice(0,10)}`;
-      const t0   = log.topics[0]?.slice(0, 18) || '-';
-      const nTopics = log.topics.length;
+      const tag  = addr === CONTRACT_LOWER ? '⭐CONTRACT'
+                 : addr === USDC_LOWER      ? '💵USDC'
+                 : addr === _nftContractAddr ? '🖼NFT'
+                 : `${addr.slice(0,10)}`;
+      const t0 = log.topics[0] || '-';
       let detail = '';
-      if (log.topics[0]?.toLowerCase() === TRANSFER_TOPIC) {
-        if (nTopics === 4) {
-          const f = '0x' + log.topics[1].slice(26);
-          const t = '0x' + log.topics[2].slice(26);
+      if (t0.toLowerCase() === TRANSFER_TOPIC) {
+        if (log.topics.length === 4) {
+          const f  = '0x' + log.topics[1].slice(26);
+          const t  = '0x' + log.topics[2].slice(26);
           const id = BigInt(log.topics[3]).toString();
           detail = `ERC721 ${f.slice(0,10)}→${t.slice(0,10)} id=${id}`;
-        } else if (nTopics === 3) {
+        } else if (log.topics.length === 3) {
           const f = '0x' + log.topics[1].slice(26);
           const t = '0x' + log.topics[2].slice(26);
           const v = log.data && log.data !== '0x' ? BigInt(log.data).toString() : '0';
           detail = `ERC20  ${f.slice(0,10)}→${t.slice(0,10)} val=${v.slice(0,12)}`;
         }
       } else {
-        detail = `t0=${t0} topics=${nTopics} data=${(log.data||'').slice(0,18)}`;
+        // Show full topic[0] + all other topics
+        const extraTopics = log.topics.slice(1).map((t, j) => {
+          const big = (() => { try { return BigInt(t); } catch(_) { return null; } })();
+          return `t${j+1}=${big !== null && big < 10000n ? big.toString() : t.slice(0,18)}`;
+        }).join(' ');
+        detail = `sig=${t0.slice(0,18)} ${extraTopics} data=${(log.data||'').slice(0,18)}`;
       }
       lines.push(`  ${String(i).padStart(2,'0')} [${tag}] ${detail}`);
     }
 
     if (processedTxs.has(txHash)) lines.push(`\n⚠️ Bu TX zaten işlendi`);
-    lines.push(`📇 NFT map boyutu: ${nftToTier.size}`);
-    lines.push(`📡 Kayıtlı chat: ${registeredChats.size}`);
+    lines.push(`📇 NFT map: ${nftToTier.size} | chat: ${registeredChats.size}`);
   } catch (e) {
     lines.push(`❌ Hata: ${e.message.slice(0, 200)}`);
   }
   return lines.join('\n');
 }
 
-async function scanBlocks(fromBlock, toBlock) {
-  const found = [];
-  const BATCH = 8;
-  for (let b = fromBlock; b <= toBlock; b += BATCH) {
-    const end = Math.min(b + BATCH - 1, toBlock);
-    const blocks = await Promise.all(
-      Array.from({ length: end - b + 1 }, (_, i) =>
-        provider.getBlock(b + i, true).catch(() => null)
-      )
-    );
-    for (const block of blocks) {
-      if (!block) continue;
-      for (const tx of (block.prefetchedTransactions || [])) {
-        if (tx.to?.toLowerCase() !== CONTRACT_LOWER) continue;
-        found.push({
-          hash: tx.hash, from: tx.from,
-          data: tx.data || tx.input,
-          blockNum: Number(block.number),
-          blockTs:  Number(block.timestamp),
-        });
-      }
-    }
-  }
-  return found;
-}
-
-async function loadHistory() {
-  isLoadingHistory = true;
-  console.log('[HISTORY] Blockscout API... (eski TX\'ler silent, son 5dk bildirimler açık)');
-  const countBefore = { 1: ts(1).count, 2: ts(2).count };
-
-  // (1) Direct-to-contract TXs — claims and direct BUYs.
-  try {
-    const r = await axios.get(
-      `https://base.blockscout.com/api/v2/addresses/${CONTRACT}/transactions`,
-      { params: { filter: 'to' }, timeout: 15000 }
-    );
-    const items = r.data?.items || [];
-    console.log(`[HISTORY] ${items.length} direkt TX alındı, işleniyor...`);
-    const txs = items
-      .filter(tx => tx.status === 'ok')
-      .sort((a, b) => a.block - b.block);
-    for (const tx of txs) {
-      try {
-        const blockTs  = Math.floor(new Date(tx.timestamp).getTime() / 1000);
-        const fromAddr = tx.from?.hash || tx.from;
-        if (!fromAddr) continue;
-        await processTx(tx.hash, fromAddr, tx.raw_input || '', tx.block, blockTs);
-      } catch (_) {}
-    }
-  } catch (e) { console.error('[HISTORY tx]', e.message); }
-
-  // (2) v9.27: scan the NFT contract for recent mint events to populate
-  // nftToTier for every BUY in the last ~5 hours, regardless of how the
-  // BUY TX itself was routed. The NFT contract address was learned during
-  // step (1) via rememberNftContract; if no claim/buy was seen yet (e.g.
-  // empty history) we skip the scan.
-  // v9.30: window reduced from 100k blocks (~2.3 days) to 9k (~5h) — old
-  // BUYs whose siblings already claimed don't need recovery, and shortening
-  // the window cuts startup time materially.
-  const HISTORY_LOOKBACK = 9000;  // ~5 hours on Base (2s blocks)
-  if (!_nftContractAddr) {
-    console.log('[HISTORY] NFT contract henüz öğrenilmedi — mint scan atlanıyor');
-  } else try {
-    const lp = await getLogsProvider();
-    const useLp = lp || provider;
-    const latest = await useLp.getBlockNumber();
-    const fromZeroTopic = '0x' + '0'.repeat(64);
-    const fromBlock = Math.max(0, latest - HISTORY_LOOKBACK);
-    let mintLogs = [];
-    try {
-      mintLogs = await useLp.getLogs({
-        address: _nftContractAddr,
-        topics: [TRANSFER_TOPIC, fromZeroTopic],
-        fromBlock, toBlock: latest,
-      });
-    } catch (e) {
-      console.log(`[HISTORY mints err] ${(e.message || '').slice(0, 80)} — fallback to chunked main RPC`);
-      const CHUNK = 9999;
-      for (let off = 0; off < HISTORY_LOOKBACK; off += CHUNK) {
-        const to = latest - off;
-        const fr = Math.max(0, to - CHUNK + 1);
-        if (to < fr) break;
-        try {
-          const part = await provider.getLogs({
-            address: _nftContractAddr,
-            topics: [TRANSFER_TOPIC, fromZeroTopic],
-            fromBlock: fr, toBlock: to,
-          });
-          mintLogs = mintLogs.concat(part);
-        } catch (_) {}
-        if (fr === 0) break;
-        await new Promise(r => setTimeout(r, 250));
-      }
-    }
-    const uniqueTxs = [...new Set(mintLogs.map(l => l.transactionHash))];
-    console.log(`[HISTORY] ${mintLogs.length} mint log -> ${uniqueTxs.length} eşsiz BUY TX (son ~5 saat) | NFT contract: ${_nftContractAddr}`);
-    for (const hash of uniqueTxs) {
-      if (processedTxs.has(hash)) continue;
-      try {
-        const [tx, receipt] = await Promise.all([
-          provider.getTransaction(hash).catch(() => null),
-          provider.getTransactionReceipt(hash).catch(() => null),
-        ]);
-        if (!tx || !receipt) continue;
-        const block = await provider.getBlock(receipt.blockNumber).catch(() => null);
-        await processTx(hash, tx.from, tx.data || '', receipt.blockNumber, block?.timestamp || 0);
-      } catch (_) {}
-    }
-  } catch (e) { console.error('[HISTORY mints]', e.message); }
-
-  // (3) v9.29: scan coordinator logs for ALL interactions (BUYs + CLAIMs)
-  // in the last ~5 hours. Catches CLAIMs from AA wallets that never appear
-  // in Blockscout's direct-TX address history (step 1 only lists tx.to=CONTRACT).
-  // Also catches any direct CLAIMs missed because step 1 is capped at 50 TXs.
-  try {
-    const lp3 = await getLogsProvider();
-    const useLp3 = lp3 || provider;
-    const latestCoord = await useLp3.getBlockNumber();
-    const fromBlockCoord = Math.max(0, latestCoord - HISTORY_LOOKBACK);
-    let coordLogs = [];
-    try {
-      coordLogs = await useLp3.getLogs({
-        address: CONTRACT_LOWER,
-        fromBlock: fromBlockCoord,
-        toBlock: latestCoord,
-      });
-    } catch (e) {
-      console.log(`[HISTORY coord] getLogs err: ${(e.message || '').slice(0, 80)}`);
-    }
-    const coordTxHashes = [...new Set(coordLogs.map(l => l.transactionHash))];
-    console.log(`[HISTORY] ${coordLogs.length} coordinator log -> ${coordTxHashes.length} TX (AA/batched) | son ~5 saat`);
-    for (const hash of coordTxHashes) {
-      if (processedTxs.has(hash)) continue;
-      try {
-        const [tx, receipt] = await Promise.all([
-          provider.getTransaction(hash).catch(() => null),
-          provider.getTransactionReceipt(hash).catch(() => null),
-        ]);
-        if (!tx || !receipt) continue;
-        const block = await provider.getBlock(receipt.blockNumber).catch(() => null);
-        await processTx(hash, tx.from, tx.data || '', receipt.blockNumber, block?.timestamp || 0);
-      } catch (_) {}
-    }
-  } catch (e) { console.error('[HISTORY coord]', e.message); }
-
-  isLoadingHistory = false;
-  const g = ts(1).count - countBefore[1];
-  const p = ts(2).count - countBefore[2];
-  console.log(`[HISTORY] Bitti — green=${g} purple=${p} yüklendi | NFT map=${nftToTier.size} | bildirimler açık`);
-}
-
-// v9.27: scan the NFT contract's mint Transfer events in a block window.
-// CONTRACT is just the coordinator and doesn't emit standard mint events
-// — the actual NFTs live on a separate contract (auto-detected). Without
-// _nftContractAddr known we can't scan (returns []); the address gets
-// learned on the first BUY/CLAIM processed.
-// v9.35: always query main RPC when Blockscout returns empty (not just on
-// throw) — Blockscout eth-rpc silently returns [] for valid ranges on
-// contracts it hasn't indexed well. Union both sources so no TX is missed.
 async function scanMintLogs(from, to) {
   if (!_nftContractAddr) return [];
   const fromZeroTopic = '0x' + '0'.repeat(64);
   const lp = await getLogsProvider();
   const allHashes = new Set();
   let bsGotResults = false;
-
   if (lp) {
     try {
-      const logs = await lp.getLogs({
-        address: _nftContractAddr,
-        topics: [TRANSFER_TOPIC, fromZeroTopic],
-        fromBlock: from, toBlock: to,
-      });
+      const logs = await lp.getLogs({ address: _nftContractAddr, topics: [TRANSFER_TOPIC, fromZeroTopic], fromBlock: from, toBlock: to });
       for (const l of logs) allHashes.add(l.transactionHash);
       if (logs.length > 0) bsGotResults = true;
     } catch (_) {}
   }
-
-  // Always query main RPC if Blockscout had no logs or wasn't available.
-  // Throws on failure so lastPollBlock doesn't advance past unscanned blocks.
   if (!bsGotResults) {
-    const logs = await provider.getLogs({
-      address: _nftContractAddr,
-      topics: [TRANSFER_TOPIC, fromZeroTopic],
-      fromBlock: from, toBlock: to,
-    });
+    const logs = await provider.getLogs({ address: _nftContractAddr, topics: [TRANSFER_TOPIC, fromZeroTopic], fromBlock: from, toBlock: to });
     for (const l of logs) allHashes.add(l.transactionHash);
   }
-
   return [...allHashes];
 }
 
-// v9.29: scan coordinator CONTRACT for any emitted logs in a block range.
-// No topic filter is needed — any event from CONTRACT means a BUY or CLAIM
-// happened (or an admin call, which processTx will silently skip). Returns
-// unique TX hashes. Catches ALL wallet types: standard EOA (tx.to=CONTRACT),
-// Coinbase Smart Wallet / ERC-4337 AA (tx.to=EntryPoint but CONTRACT still
-// emits), and batched / multicall TXs.
-// v9.35: always query main RPC when Blockscout returns empty (not just on
-// throw). Blockscout eth-rpc was silently returning [] for valid block ranges
-// — the old exception-only fallback meant lastPollBlock advanced past those
-// blocks, permanently losing any claims in them. Now: try Blockscout, and if
-// it returns 0 logs (OR wasn't available), also query main RPC and union the
-// results. Throws only if main RPC fails, so lastPollBlock stays put.
 async function scanCoordinatorLogs(from, to) {
   const lp = await getLogsProvider();
   const allHashes = new Set();
   let bsGotResults = false;
-
   if (lp) {
     try {
       const logs = await lp.getLogs({ address: CONTRACT_LOWER, fromBlock: from, toBlock: to });
@@ -1262,21 +871,13 @@ async function scanCoordinatorLogs(from, to) {
       if (logs.length > 0) bsGotResults = true;
     } catch (_) {}
   }
-
-  // Query main RPC when Blockscout had no logs or wasn't available.
-  // Throws on failure → pollLoop catch fires → lastPollBlock unchanged.
   if (!bsGotResults) {
     const logs = await provider.getLogs({ address: CONTRACT_LOWER, fromBlock: from, toBlock: to });
     for (const l of logs) allHashes.add(l.transactionHash);
   }
-
   return [...allHashes];
 }
 
-// v9.32: fetch tx + receipt + block with retries. The per-TX RPC calls in
-// pollLoop were silently dropping claims when getTransaction returned null
-// due to transient RPC failures (e.g. propagation lag, rate limits).
-// Returns null only after 4 attempts with backoff.
 async function fetchTxBundle(hash) {
   const MAX_TRIES = 4;
   for (let i = 0; i < MAX_TRIES; i++) {
@@ -1306,18 +907,11 @@ async function pollLoop() {
         const from = lastPollBlock + 1;
         const to   = Math.min(cur, lastPollBlock + 20);
 
-        // v9.29: event-based discovery — catches ALL wallet types.
-        // EOA direct calls, Coinbase Smart Wallet (AA/ERC-4337 via EntryPoint),
-        // batched / multicall — all make CONTRACT emit a log, so getLogs
-        // on CONTRACT finds them regardless of tx.to.
         const coordTxs = await scanCoordinatorLogs(from, to);
         for (const hash of coordTxs) {
           if (processedTxs.has(hash)) continue;
           const bundle = await fetchTxBundle(hash);
-          if (!bundle) {
-            console.log(`[POLL miss] ${hash.slice(0,10)} fetch failed after retries — block ${from}-${to}`);
-            continue;
-          }
+          if (!bundle) { console.log(`[POLL miss] ${hash.slice(0,10)} fetch failed`); continue; }
           try {
             await processTx(hash, bundle.tx.from, bundle.tx.data || '', bundle.receipt.blockNumber, bundle.block?.timestamp || 0);
           } catch (e) {
@@ -1325,16 +919,11 @@ async function pollLoop() {
           }
         }
 
-        // Supplementary: NFT contract mint scan — backup for BUYs in case
-        // the coordinator logs RPC lags behind the NFT contract's indexing.
         const mintTxs = await scanMintLogs(from, to);
         for (const hash of mintTxs) {
           if (processedTxs.has(hash)) continue;
           const bundle = await fetchTxBundle(hash);
-          if (!bundle) {
-            console.log(`[POLL miss] ${hash.slice(0,10)} (mint scan) fetch failed after retries`);
-            continue;
-          }
+          if (!bundle) { console.log(`[POLL miss] ${hash.slice(0,10)} (mint) fetch failed`); continue; }
           try {
             await processTx(hash, bundle.tx.from, bundle.tx.data || '', bundle.receipt.blockNumber, bundle.block?.timestamp || 0);
           } catch (e) {
@@ -1365,7 +954,7 @@ function buildTierMsg(tierNum) {
   const cycleSlice = state.history.slice(0, posInCycle);
   const cycleAvg   = cycleSlice.reduce((s, c) => s + c.usd, 0) / (cycleSlice.length || 1);
   const sEmoji     = state.streakDir === 'down' ? '🔴' : '🟢';
-  const avgLines   = [5, 10, 15, 20, 50, 100]
+  const avgLines   = [5, 10, 15, 20, 25, 50, 100, 200]
     .map(n => { const v = calcAvg(state.history, n); return v !== null ? `Avg${n}: $${v.toFixed(2)}` : null; })
     .filter(Boolean).join('\n');
   return [
@@ -1380,23 +969,29 @@ function buildTierMsg(tierNum) {
   ].join('\n');
 }
 
-const TIERS_ORDER = [1, 2];
+const TIERS_ORDER = [1, 2, 3];
 
 async function startConversation(chatId) {
   const isNew = !registeredChats.has(String(chatId));
   registeredChats.add(String(chatId));
   if (isNew) console.log(`[TG] Yeni chat: ${chatId} (toplam: ${registeredChats.size})`);
 
-  const lines = [`👋 <b>Scratch Card Tracker</b> ${VERSION}`, '', '✅ Bu chat bildirim listesine eklendi.', '', '📊 Döngü Sayıcıları:'];
-  for (const t of TIERS_ORDER) {
-    const info = TIER_INFO[t];
-    lines.push(`  • ${info.emoji} ${info.name} ($${info.payUsd} USDC): Kaç paket açıldı? (?/${info.target})`);
-  }
-  lines.push('', '💬 Sırayla cevapla');
+  const lines = [
+    `👋 <b>Scratch Card Tracker</b> ${VERSION}`,
+    '',
+    '✅ Bu chat bildirim listesine eklendi.',
+    '',
+    '📊 Döngü Sayıcıları:',
+    `  • 🔵 mavi: Kaç tane açıldı? (?/200)`,
+    `  • 🟢 yeşil: Kaç tane açıldı? (?/200)`,
+    `  • 🟣 mor: Kaç tane açıldı? (?/200)`,
+    '',
+    '💬 Sırayla cevapla',
+  ];
   await bot.sendMessage(chatId, lines.join('\n'), { parse_mode: 'HTML' });
   conversations[chatId] = { step: 0, data: {} };
   const first = TIER_INFO[TIERS_ORDER[0]];
-  await bot.sendMessage(chatId, `${first.emoji} ${first.name} ($${first.payUsd} USDC): Kaç paket açıldı? (?/${first.target})`);
+  await bot.sendMessage(chatId, `${first.emoji} ${first.name}: Kaç tane açıldı? (?/${first.target})`);
 }
 
 async function handleConversationReply(chatId, text) {
@@ -1412,7 +1007,7 @@ async function handleConversationReply(chatId, text) {
   conv.step++;
   if (conv.step < TIERS_ORDER.length) {
     const next = TIER_INFO[TIERS_ORDER[conv.step]];
-    await bot.sendMessage(chatId, `${next.emoji} ${next.name} ($${next.payUsd} USDC): Kaç paket açıldı? (?/${next.target})`);
+    await bot.sendMessage(chatId, `${next.emoji} ${next.name}: Kaç tane açıldı? (?/${next.target})`);
   } else {
     delete conversations[chatId];
     for (const t of TIERS_ORDER)
@@ -1435,10 +1030,9 @@ async function main() {
   bot.onText(/\/start/, (msg) => startConversation(msg.chat.id).catch(console.error));
 
   bot.onText(/\/track/, async (msg) => {
-    const chatId = msg.chat.id;
-    registeredChats.add(String(chatId));
-    console.log(`[TG] Chat kaydedildi: ${chatId}`);
-    await bot.sendMessage(chatId, '✅ Bu chat bildirim listesine eklendi.');
+    registeredChats.add(String(msg.chat.id));
+    console.log(`[TG] Chat kaydedildi: ${msg.chat.id}`);
+    await bot.sendMessage(msg.chat.id, '✅ Bu chat bildirim listesine eklendi.');
   });
 
   bot.onText(/\/stop/, async (msg) => {
@@ -1454,28 +1048,32 @@ async function main() {
       '/start — Botu başlat, döngü sayıcısını ayarla',
       '/track — Bu chati bildirim listesine ekle',
       '/stop — Bildirimleri durdur',
-      '/test — Bot durumu ve NFT map özeti',
-      '/sc1 — 🟢 Green ($1 USDC) istatistikleri',
-      '/sc5 — 🟣 Purple ($5 USDC) istatistikleri',
+      '/test — Bot durumu',
+      '/sc1 — 🔵 Mavi istatistikleri',
+      '/sc2 — 🟢 Yeşil istatistikleri',
+      '/sc3 — 🟣 Mor istatistikleri',
       '/komut — Bu listeyi göster',
-      '/diag &lt;TX_HASH&gt; — Belirli bir TX\'i analiz et',
+      '/diag &lt;TX_HASH&gt; — TX analizi',
     ];
     await bot.sendMessage(msg.chat.id, lines.join('\n'), { parse_mode: 'HTML' });
   });
 
   bot.onText(/\/test/, async (msg) => {
-    const chatId = msg.chat.id;
-    registeredChats.add(String(chatId));
-    try {
-      await bot.sendMessage(chatId,
-        `✅ <b>Test mesajı</b> ${VERSION}\n📡 Bot çalışıyor!\n📋 Kayıtlı chat: ${registeredChats.size}\n📇 NFT map: ${nftToTier.size}\n🟢 green (${SC1_TARGET}): ${ts(1).sessionCount} | 🟣 purple (${SC5_TARGET}): ${ts(2).sessionCount}`,
-        { parse_mode: 'HTML' }
-      );
-    } catch (e) { console.error('[TEST]', e.message); }
+    registeredChats.add(String(msg.chat.id));
+    const lines = [
+      `✅ <b>Test</b> ${VERSION}`,
+      `📡 Kayıtlı chat: ${registeredChats.size}`,
+      `📇 NFT map: ${nftToTier.size}`,
+      `🔵 mavi (${SC1_TARGET}): ${ts(1).sessionCount}`,
+      `🟢 yeşil (${SC2_TARGET}): ${ts(2).sessionCount}`,
+      `🟣 mor (${SC3_TARGET}): ${ts(3).sessionCount}`,
+    ];
+    await bot.sendMessage(msg.chat.id, lines.join('\n'), { parse_mode: 'HTML' });
   });
 
   bot.onText(/\/sc1/, (msg) => bot.sendMessage(msg.chat.id, buildTierMsg(1), { parse_mode: 'HTML' }).catch(console.error));
-  bot.onText(/\/sc5/, (msg) => bot.sendMessage(msg.chat.id, buildTierMsg(2), { parse_mode: 'HTML' }).catch(console.error));
+  bot.onText(/\/sc2/, (msg) => bot.sendMessage(msg.chat.id, buildTierMsg(2), { parse_mode: 'HTML' }).catch(console.error));
+  bot.onText(/\/sc3/, (msg) => bot.sendMessage(msg.chat.id, buildTierMsg(3), { parse_mode: 'HTML' }).catch(console.error));
 
   bot.onText(/\/diag (.+)/, async (msg, match) => {
     const chatId = msg.chat.id;
@@ -1496,9 +1094,8 @@ async function main() {
   bot.on('polling_error', (e) => {
     if (e.message?.includes('409')) {
       pollingErrCount++;
-      if (pollingErrCount === 1)
-        console.error('[TG] 409 Conflict — başka bir instance aktif! Eski servisi durdur.');
-      if (pollingErrCount > 80) { process.exit(1); }
+      if (pollingErrCount === 1) console.error('[TG] 409 Conflict — başka bir instance aktif!');
+      if (pollingErrCount > 80) process.exit(1);
     } else {
       pollingErrCount = 0;
       console.error('[TG polling]', e.message);
@@ -1506,14 +1103,11 @@ async function main() {
   });
 
   console.log(`[${VERSION}] Contract: ${CONTRACT}`);
-  console.log(`[${VERSION}] green=$1 döngü=${SC1_TARGET} | purple=$5 döngü=${SC5_TARGET}`);
-  console.log(`[${VERSION}] BOT_START_TS=${BOT_START_TS} LIVE_WINDOW_SEC=${LIVE_WINDOW_SEC} CG_KEY=${COINGECKO_KEY ? 'yes' : 'no'}`);
+  console.log(`[${VERSION}] mavi(1)=${SC1_TARGET} yeşil(2)=${SC2_TARGET} mor(3)=${SC3_TARGET}`);
+  console.log(`[${VERSION}] BOT_START_TS=${BOT_START_TS} CG_KEY=${COINGECKO_KEY ? 'yes' : 'no'}`);
   console.log(`[${VERSION}] Kayıtlı chat: ${registeredChats.size} | CHANNEL_ID=${CHANNEL_ID || 'YOK — /track ile ekleyin'}`);
-  if (registeredChats.size === 0) {
-    console.log(`[UYARI] Hiç kayıtlı chat yok! Telegram'dan /track veya /test gönderin.`);
-  }
+  if (registeredChats.size === 0) console.log(`[UYARI] Hiç kayıtlı chat yok! /track veya /test gönderin.`);
 
-  // v9.31: start live polling immediately with no history preload.
   lastPollBlock = 0;
   await pollLoop();
 }
