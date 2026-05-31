@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v10.2';
+const VERSION = 'v10.3';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -35,10 +35,12 @@ const RPCS = [
 ].filter(Boolean);
 
 // v10.0: 3 tiers, all $1 USDC. Tier encoded in coordinator BUY event topics.
+// jackpotUsd: center value; ±20% window used for detection.
+// jackpotTotal: expected jackpots per 200-cycle.
 const TIER_INFO = {
-  1: { name: 'mavi',  emoji: '🔵', payUsd: 1, target: SC1_TARGET },
-  2: { name: 'yeşil', emoji: '🟢', payUsd: 1, target: SC2_TARGET },
-  3: { name: 'mor',   emoji: '🟣', payUsd: 1, target: SC3_TARGET },
+  1: { name: 'mavi',  emoji: '🔵', payUsd: 1, target: SC1_TARGET, jackpotUsd: 5,  jackpotTotal: 6 },
+  2: { name: 'yeşil', emoji: '🟢', payUsd: 1, target: SC2_TARGET, jackpotUsd: 10, jackpotTotal: 4 },
+  3: { name: 'mor',   emoji: '🟣', payUsd: 1, target: SC3_TARGET, jackpotUsd: 20, jackpotTotal: 3 },
 };
 const PER_TOKEN_MAX_USD = 100;
 
@@ -59,7 +61,7 @@ const WETH_LOWER       = WETH.toLowerCase();
 const tierStates = {};
 function ts(tier) {
   if (!tierStates[tier])
-    tierStates[tier] = { history: [], count: 0, sessionCount: 0, streak: 0, streakDir: null };
+    tierStates[tier] = { history: [], count: 0, sessionCount: 0, streak: 0, streakDir: null, jackpotCycleCount: 0 };
   return tierStates[tier];
 }
 
@@ -749,22 +751,24 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
   const cycleSlice = state.history.slice(0, posInCycle);
   const cycleAvg   = cycleSlice.reduce((s, c) => s + c.usd, 0) / (cycleSlice.length || 1);
 
-  // Show avg(5,10,15,20,25,50,100,200) for all 3 tiers on every notification
-  const AVG_NS = [5, 10, 15, 20, 25, 50, 100, 200];
-  const allAvgLines = [1, 2, 3].map(t => {
-    const tState = ts(t);
-    const tInfo  = TIER_INFO[t];
-    const avgs = AVG_NS
-      .map(n => { const v = calcAvg(tState.history, n); return v !== null ? `Avg${n}:$${v.toFixed(2)}` : null; })
-      .filter(Boolean).join(' | ');
-    return avgs ? `${tInfo.emoji} ${avgs}` : null;
-  }).filter(Boolean).join('\n');
+  // Jackpot detection: totalUsd within ±20% of tier's jackpot center value.
+  // Reset per-cycle counter when a new cycle begins (posInCycle wraps to 1).
+  const { jackpotUsd, jackpotTotal } = tierInfo;
+  const isJackpot = totalUsd >= jackpotUsd * 0.8 && totalUsd <= jackpotUsd * 1.2;
+  if (posInCycle === 1 && pos > 1) state.jackpotCycleCount = 0; // new cycle
+  if (isJackpot) state.jackpotCycleCount++;
+
+  // Avg for this tier only
+  const avgLine = [5, 10, 15, 20, 25, 50, 100, 200]
+    .map(n => { const v = calcAvg(state.history, n); return v !== null ? `Avg${n}:$${v.toFixed(2)}` : null; })
+    .filter(Boolean).join(' | ');
 
   const msg = [
     `${tierInfo.emoji} Total Value: $${totalUsd.toFixed(2)} [${tierInfo.name}]`,
     `📍 Döngü: ${posInCycle}/${cycleSize} (~${remaining} kaldı) — Döngü Avg: $${cycleAvg.toFixed(2)}`,
     `🔴 Streak: ${state.streak}`,
-    allAvgLines || null,
+    isJackpot ? `🎰 Jackpot ${state.jackpotCycleCount}/${jackpotTotal}` : null,
+    avgLine ? `📊 ${avgLine}` : null,
     `👤 ${claimer}`,
     `🕐 ${date} | <a href="${txUrl}">TX</a>`,
   ].filter(Boolean).join('\n');
