@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v10.6';
+const VERSION = 'v10.7';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -714,21 +714,7 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
   // Skip free packages — only notify for cards bought with ~1 USDC.
   if (entry && typeof entry.paid === 'number' && entry.paid < MIN_PAID_USDC) return;
 
-  // Tier still unknown but we have a confirmed burn + real reward → send a
-  // ❓ notification so a real claim is never silently dropped.
-  if (tier === null) {
-    if (burn && (!isLoadingHistory || isRecentTx)) {
-      const date   = new Date(blockTs * 1000).toISOString().replace('T', ' ').slice(0, 19) + 'Z';
-      const txUrl  = `https://basescan.org/tx/${txHash}`;
-      const msg = [
-        `❓ Total Value: $${totalUsd.toFixed(2)} [kart #${claimedNftId ?? '?'} — tier bilinmiyor]`,
-        `👤 ${claimer}`,
-        `🕐 ${date} | <a href="${txUrl}">TX</a>`,
-      ].join('\n');
-      await sendNotification(msg);
-    }
-    return;
-  }
+  if (tier === null) return;
 
   const tierInfo  = TIER_INFO[tier];
   const cycleSize = tierInfo.target;
