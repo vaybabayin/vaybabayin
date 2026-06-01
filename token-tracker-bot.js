@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v10.5';
+const VERSION = 'v10.6';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -410,7 +410,6 @@ async function findMintTxBlockscout(nftId) {
   } catch (e) {
     if (e.response?.status === 404 && !_bsInstancesDisabled) {
       _bsInstancesDisabled = true;
-      console.log(`[BS instances] 404 — disabled for session`);
     }
   }
   return null;
@@ -450,13 +449,9 @@ async function _scanLogsForMint(rpcLabel, lp, queryAddr, tokenIdHex, fromZeroTop
         topics: [TRANSFER_TOPIC, fromZeroTopic, null, tokenIdHex],
         fromBlock, toBlock,
       });
-      if (logs.length) {
-        console.log(`[${rpcLabel} hit] mint @ block=${logs[0].blockNumber} after ${chunksTried} chunks`);
-        return logs[0].transactionHash;
-      }
+      if (logs.length) return logs[0].transactionHash;
     } catch (e) {
       chunksFailed++;
-      if (chunksFailed === 1) console.log(`[${rpcLabel} err] ${(e.message || '').slice(0, 80)}`);
     }
     if (fromBlock === 0) break;
     if (delayMs) await new Promise(r => setTimeout(r, delayMs));
@@ -499,20 +494,16 @@ async function findMintTxHash(nftId) {
 
 async function recoverTierFromBuyTx(nftId) {
   await ensureRecentTiers();
-  if (nftToTier.has(nftId)) {
-    const info = nftToTier.get(nftId);
-    console.log(`[RECOVER cache] nft=${nftId} tier=${info.tier} (${TIER_INFO[info.tier]?.name})`);
-    return info.tier;
-  }
+  if (nftToTier.has(nftId)) return nftToTier.get(nftId).tier;
   try {
     const found = await findMintTxHash(nftId);
-    if (!found) { console.log(`[RECOVER fail] nft=${nftId}: mint TX bulunamadı`); return null; }
+    if (!found) return null;
     const { hash: buyTxHash, src: lookupSrc } = found;
     const [buyTx, buyReceipt] = await Promise.all([
       provider.getTransaction(buyTxHash).catch(() => null),
       provider.getTransactionReceipt(buyTxHash).catch(() => null),
     ]);
-    if (!buyReceipt) { console.log(`[RECOVER fail] nft=${nftId}: receipt yok`); return null; }
+    if (!buyReceipt) return null;
     const allMints = findAllNftMints(buyReceipt);
     const tier = tierFromCalldata(buyTx?.data || '') ?? findBuyTierFromLogs(buyReceipt, allMints.map(m => m.nftId));
     if (tier) {
@@ -521,13 +512,9 @@ async function recoverTierFromBuyTx(nftId) {
       for (const m of allMints) {
         nftToTier.set(m.nftId, { tier, buyer: m.to, buyTxHash, buyTs: block?.timestamp || 0, paid });
       }
-      console.log(`[RECOVER ${lookupSrc}] nft=${nftId} tier=${tier} (${TIER_INFO[tier]?.name}) paid=$${paid.toFixed(2)}${paid < MIN_PAID_USDC ? ' FREE' : ''} from ${buyTxHash.slice(0,10)}`);
-    } else {
-      console.log(`[RECOVER no-tier] nft=${nftId}: BUY TX'te tier bilgisi yok ${buyTxHash.slice(0,10)}`);
     }
     return tier;
-  } catch (e) {
-    console.log(`[RECOVER fail] nft=${nftId}: ${(e.message || '').slice(0, 80)}`);
+  } catch (_) {
     return null;
   }
 }
@@ -549,8 +536,7 @@ async function ensureRecentTiers() {
           const logs = await rpc.getLogs(params);
           for (const l of logs) allHashes.add(l.transactionHash);
           return logs.length;
-        } catch (e) {
-          console.log(`[ensureRecentTiers ${label}] ${(e.message || '').slice(0, 70)}`);
+        } catch (_) {
           return -1;
         }
       };
@@ -566,8 +552,6 @@ async function ensureRecentTiers() {
         ].filter(Boolean));
       }
 
-      console.log(`[ensureRecentTiers] ${allHashes.size} TX adayı (bs mint=${n1} coord=${n2})`);
-      let registered = 0;
       for (const hash of allHashes) {
         try {
           const [tx, receipt] = await Promise.all([
@@ -584,14 +568,11 @@ async function ensureRecentTiers() {
           for (const m of mints) {
             if (!nftToTier.has(m.nftId)) {
               nftToTier.set(m.nftId, { tier, buyer: m.to, buyTxHash: hash, buyTs: block?.timestamp || 0, paid });
-              registered++;
             }
           }
         } catch (_) {}
       }
-      console.log(`[ensureRecentTiers] tamamlandı — ${registered} yeni tier | map=${nftToTier.size}`);
     } catch (e) {
-      console.log(`[ensureRecentTiers] hata: ${(e.message || '').slice(0, 80)}`);
       _recentTiersPromise = null;
       throw e;
     }
@@ -687,33 +668,25 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
   const isRecentTx = blockTs >= BOT_START_TS - LIVE_WINDOW_SEC;
 
   let receipt;
-  try { receipt = await provider.getTransactionReceipt(txHash); } catch (e) {
-    if (!isLoadingHistory || isRecentTx)
-      console.log(`[SKIP rpc-err] ${txHash.slice(0,10)}: ${e.message.slice(0,60)}`);
-    return;
-  }
+  try { receipt = await provider.getTransactionReceipt(txHash); } catch (e) { return; }
   if (!receipt || receipt.status === 0) return;
 
   rememberNftContract(receipt);
 
-  // BUY TX — detect tier from calldata (all param slots) or event topics
+  // BUY TX — detect tier from calldata (all param slots) or event topics.
+  // Silently register; no notification, no routine log.
   const allMints = findAllNftMints(receipt);
   if (allMints.length) {
     const mintedIds = allMints.map(m => m.nftId);
-    const cdTier  = tierFromCalldata(data);
-    const logTier = cdTier == null ? findBuyTierFromLogs(receipt, mintedIds) : null;
-    const tier    = cdTier ?? logTier;
+    const tier = tierFromCalldata(data) ?? findBuyTierFromLogs(receipt, mintedIds);
     if (tier) {
       const paid = findUsdcPayment(receipt, allMints[0].to);
       for (const m of allMints) {
         nftToTier.set(m.nftId, { tier, buyer: m.to, buyTxHash: txHash, buyTs: blockTs, paid });
       }
-      if (!isLoadingHistory || isRecentTx)
-        console.log(`[BUY] tier=${tier}(${TIER_INFO[tier]?.name}) paid=$${paid.toFixed(2)}${paid < MIN_PAID_USDC ? ' FREE' : ''} src=${cdTier?'cd':'log'} mints=${allMints.length} ids=[${mintedIds.join(',')}] sel=${data?.slice(0,10)} | ${txHash.slice(0,10)}`);
-    } else {
-      // Log enough detail to diagnose why tier wasn't found
-      if (!isLoadingHistory || isRecentTx)
-        console.log(`[BUY?] tier bilinmiyor — sel=${data?.slice(0,10)} datalen=${data?.length} mints=${allMints.length} ids=[${mintedIds.join(',')}] | ${txHash.slice(0,10)}`);
+    } else if (!isLoadingHistory || isRecentTx) {
+      // Unknown tier on a real mint signals a contract/format change — keep.
+      console.log(`[BUY?] tier yok sel=${data?.slice(0,10)} ids=[${mintedIds.join(',')}] | ${txHash.slice(0,10)}`);
     }
     return;
   }
@@ -722,42 +695,27 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
   const burn = findNftBurn(receipt);
   const claimer = burn ? burn.from.toLowerCase() : from.toLowerCase();
 
-  const { received, src, sources } = collectReceived(receipt, claimer);
-  if (!Object.keys(received).length) {
-    // Log only when there's a confirmed burn so we can spot real misses
-    if (burn && (!isLoadingHistory || isRecentTx))
-      console.log(`[CLAIM?] nft=${burn.nftId} burn ama ERC20 transfer yok claimer=${claimer.slice(0,10)} | ${txHash.slice(0,10)}`);
-    return;
-  }
+  const { received, sources } = collectReceived(receipt, claimer);
+  if (!Object.keys(received).length) return;
 
   let claimedNftId = burn?.nftId ?? nftIdFromCalldata(data);
 
   let entry = claimedNftId ? nftToTier.get(claimedNftId) : null;
   let tier = entry?.tier ?? null;
 
-  const { totalUsd, tokenSummary, tokenDetail, droppedSummary } = await calcTotalUsd(received, sources);
-  if (totalUsd <= 0) {
-    if (!isLoadingHistory || isRecentTx)
-      console.log(`[SKIP no-value] nft=${claimedNftId} dropped=[${droppedSummary.join(' ')}] | ${txHash.slice(0,10)}`);
-    return;
-  }
+  const { totalUsd } = await calcTotalUsd(received, sources);
+  if (totalUsd <= 0) return;
 
   if (tier === null && claimedNftId && (!isLoadingHistory || isRecentTx)) {
     tier = await recoverTierFromBuyTx(claimedNftId);
     entry = claimedNftId ? nftToTier.get(claimedNftId) : null; // re-read after recovery
   }
 
-  // v10.5: skip free packages — only notify for cards bought with ~1 USDC.
-  // Free packages carry a tier in calldata but had no USDC payment.
-  if (entry && typeof entry.paid === 'number' && entry.paid < MIN_PAID_USDC) {
-    if (!isLoadingHistory || isRecentTx)
-      console.log(`[FREE skip] nft=${claimedNftId} tier=${tier} paid=$${entry.paid.toFixed(2)} won=$${totalUsd.toFixed(2)} | ${txHash.slice(0,10)}`);
-    return;
-  }
+  // Skip free packages — only notify for cards bought with ~1 USDC.
+  if (entry && typeof entry.paid === 'number' && entry.paid < MIN_PAID_USDC) return;
 
-  // v10.4: when tier is still unknown but we have a CONFIRMED burn + real
-  // reward value, send a ❓ notification — never silently drop a real claim.
-  // (Unrelated coordinator events never reach here because they have no burn.)
+  // Tier still unknown but we have a confirmed burn + real reward → send a
+  // ❓ notification so a real claim is never silently dropped.
   if (tier === null) {
     if (burn && (!isLoadingHistory || isRecentTx)) {
       const date   = new Date(blockTs * 1000).toISOString().replace('T', ' ').slice(0, 19) + 'Z';
@@ -767,7 +725,6 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
         `👤 ${claimer}`,
         `🕐 ${date} | <a href="${txUrl}">TX</a>`,
       ].join('\n');
-      console.log(`[?CLAIM] won=$${totalUsd.toFixed(2)} nft=${claimedNftId} map=${nftToTier.size} | ${txHash.slice(0,10)}`);
       await sendNotification(msg);
     }
     return;
@@ -822,7 +779,7 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
     `🕐 ${date} | <a href="${txUrl}">TX</a>`,
   ].filter(Boolean).join('\n');
 
-  console.log(`[✓] ${tierInfo.name} won=$${totalUsd.toFixed(2)} nft=${claimedNftId} cyc=${posInCycle}/${cycleSize} | ${tokenDetail.join(' || ')} | ${txHash.slice(0,10)}`);
+  console.log(`[✓] ${tierInfo.name} $${totalUsd.toFixed(2)} ${posInCycle}/${cycleSize} #${claimedNftId}`);
   await sendNotification(msg);
 }
 
@@ -1181,11 +1138,8 @@ async function main() {
     }
   });
 
-  console.log(`[${VERSION}] Contract: ${CONTRACT}`);
-  console.log(`[${VERSION}] mavi(1)=${SC1_TARGET} yeşil(2)=${SC2_TARGET} mor(3)=${SC3_TARGET}`);
-  console.log(`[${VERSION}] BOT_START_TS=${BOT_START_TS} CG_KEY=${COINGECKO_KEY ? 'yes' : 'no'}`);
-  console.log(`[${VERSION}] Kayıtlı chat: ${registeredChats.size} | CHANNEL_ID=${CHANNEL_ID || 'YOK — /track ile ekleyin'}`);
-  if (registeredChats.size === 0) console.log(`[UYARI] Hiç kayıtlı chat yok! /track veya /test gönderin.`);
+  console.log(`[${VERSION}] başladı | mavi=${SC1_TARGET} yeşil=${SC2_TARGET} mor=${SC3_TARGET} | chat=${registeredChats.size}`);
+  if (registeredChats.size === 0) console.log(`[UYARI] Kayıtlı chat yok — /track veya /test gönderin.`);
 
   lastPollBlock = 0;
   await pollLoop();
