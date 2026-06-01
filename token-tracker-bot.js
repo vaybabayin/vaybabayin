@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v10.4';
+const VERSION = 'v10.5';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -43,6 +43,9 @@ const TIER_INFO = {
   3: { name: 'mor',   emoji: '🟣', payUsd: 1, target: SC3_TARGET, jackpotUsd: 20, jackpotTotal: 3 },
 };
 const PER_TOKEN_MAX_USD = 100;
+// v10.5: only notify for packages bought with ~1 USDC. Free packages
+// (paid = 0) have a tier in calldata but no USDC payment — skip them.
+const MIN_PAID_USDC = 0.5;
 
 const TRANSFER_TOPIC    = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 // Coordinator event sig prefixes (first 8 bytes of topic[0])
@@ -514,10 +517,11 @@ async function recoverTierFromBuyTx(nftId) {
     const tier = tierFromCalldata(buyTx?.data || '') ?? findBuyTierFromLogs(buyReceipt, allMints.map(m => m.nftId));
     if (tier) {
       const block = await provider.getBlock(buyReceipt.blockNumber).catch(() => null);
+      const paid = allMints.length ? findUsdcPayment(buyReceipt, allMints[0].to) : 0;
       for (const m of allMints) {
-        nftToTier.set(m.nftId, { tier, buyer: m.to, buyTxHash, buyTs: block?.timestamp || 0 });
+        nftToTier.set(m.nftId, { tier, buyer: m.to, buyTxHash, buyTs: block?.timestamp || 0, paid });
       }
-      console.log(`[RECOVER ${lookupSrc}] nft=${nftId} tier=${tier} (${TIER_INFO[tier]?.name}) from ${buyTxHash.slice(0,10)}`);
+      console.log(`[RECOVER ${lookupSrc}] nft=${nftId} tier=${tier} (${TIER_INFO[tier]?.name}) paid=$${paid.toFixed(2)}${paid < MIN_PAID_USDC ? ' FREE' : ''} from ${buyTxHash.slice(0,10)}`);
     } else {
       console.log(`[RECOVER no-tier] nft=${nftId}: BUY TX'te tier bilgisi yok ${buyTxHash.slice(0,10)}`);
     }
@@ -576,9 +580,10 @@ async function ensureRecentTiers() {
           const tier = tierFromCalldata(tx?.data || '') ?? findBuyTierFromLogs(receipt, mints.map(m => m.nftId));
           if (!tier) continue;
           const block = await provider.getBlock(receipt.blockNumber).catch(() => null);
+          const paid = findUsdcPayment(receipt, mints[0].to);
           for (const m of mints) {
             if (!nftToTier.has(m.nftId)) {
-              nftToTier.set(m.nftId, { tier, buyer: m.to, buyTxHash: hash, buyTs: block?.timestamp || 0 });
+              nftToTier.set(m.nftId, { tier, buyer: m.to, buyTxHash: hash, buyTs: block?.timestamp || 0, paid });
               registered++;
             }
           }
@@ -699,11 +704,12 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
     const logTier = cdTier == null ? findBuyTierFromLogs(receipt, mintedIds) : null;
     const tier    = cdTier ?? logTier;
     if (tier) {
+      const paid = findUsdcPayment(receipt, allMints[0].to);
       for (const m of allMints) {
-        nftToTier.set(m.nftId, { tier, buyer: m.to, buyTxHash: txHash, buyTs: blockTs });
+        nftToTier.set(m.nftId, { tier, buyer: m.to, buyTxHash: txHash, buyTs: blockTs, paid });
       }
       if (!isLoadingHistory || isRecentTx)
-        console.log(`[BUY] tier=${tier}(${TIER_INFO[tier]?.name}) src=${cdTier?'cd':'log'} mints=${allMints.length} ids=[${mintedIds.join(',')}] sel=${data?.slice(0,10)} | ${txHash.slice(0,10)}`);
+        console.log(`[BUY] tier=${tier}(${TIER_INFO[tier]?.name}) paid=$${paid.toFixed(2)}${paid < MIN_PAID_USDC ? ' FREE' : ''} src=${cdTier?'cd':'log'} mints=${allMints.length} ids=[${mintedIds.join(',')}] sel=${data?.slice(0,10)} | ${txHash.slice(0,10)}`);
     } else {
       // Log enough detail to diagnose why tier wasn't found
       if (!isLoadingHistory || isRecentTx)
@@ -726,10 +732,8 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
 
   let claimedNftId = burn?.nftId ?? nftIdFromCalldata(data);
 
-  let tier = null;
-  if (claimedNftId && nftToTier.has(claimedNftId)) {
-    tier = nftToTier.get(claimedNftId).tier;
-  }
+  let entry = claimedNftId ? nftToTier.get(claimedNftId) : null;
+  let tier = entry?.tier ?? null;
 
   const { totalUsd, tokenSummary, tokenDetail, droppedSummary } = await calcTotalUsd(received, sources);
   if (totalUsd <= 0) {
@@ -740,6 +744,15 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
 
   if (tier === null && claimedNftId && (!isLoadingHistory || isRecentTx)) {
     tier = await recoverTierFromBuyTx(claimedNftId);
+    entry = claimedNftId ? nftToTier.get(claimedNftId) : null; // re-read after recovery
+  }
+
+  // v10.5: skip free packages — only notify for cards bought with ~1 USDC.
+  // Free packages carry a tier in calldata but had no USDC payment.
+  if (entry && typeof entry.paid === 'number' && entry.paid < MIN_PAID_USDC) {
+    if (!isLoadingHistory || isRecentTx)
+      console.log(`[FREE skip] nft=${claimedNftId} tier=${tier} paid=$${entry.paid.toFixed(2)} won=$${totalUsd.toFixed(2)} | ${txHash.slice(0,10)}`);
+    return;
   }
 
   // v10.4: when tier is still unknown but we have a CONFIRMED burn + real
