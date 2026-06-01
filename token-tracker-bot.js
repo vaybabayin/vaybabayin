@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v10.3';
+const VERSION = 'v10.4';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -322,17 +322,31 @@ function findNftBurn(receipt) {
   return null;
 }
 
-// v10.1: tier is param[1] in BUY function calldata.
-// Function: buy(uint64 batchId, uint8 tier, uint256 seed, uint256 nonce, uint256 deadline)
-// Selector : 0x3e29984c
-// param[0] batchId → data[10:74]
-// param[1] tier    → data[74:138]   ← 1=mavi 2=yeşil 3=mor
+// v10.4: scan ALL 32-byte parameter slots in calldata for a tier value.
+// Primary: try param[1] first — buy(batchId, tier, seed, nonce, deadline)
+//   selector 0x3e29984c: param[1] at data[74:138].
+// Fallback: scan every other 32-byte slot in case a different function
+//   (e.g. buyAndAssign) puts the tier at a different position.
+// Only returns a value in {1, 2, 3}; skips any slot whose uint256 value
+// falls outside that range.
 function tierFromCalldata(data) {
-  if (!data || data.length < 138) return null;
-  try {
-    const val = Number(BigInt('0x' + data.slice(74, 138)));
-    if (val >= 1 && val <= 3) return val;
-  } catch (_) {}
+  if (!data || data.length < 10) return null;
+  const paramHex = data.slice(10); // skip '0x' + 4-byte selector
+  // Param[1] first (known position for buy())
+  if (paramHex.length >= 128) {
+    try {
+      const val = Number(BigInt('0x' + paramHex.slice(64, 128)));
+      if (val >= 1 && val <= 3) return val;
+    } catch (_) {}
+  }
+  // Scan all other slots
+  for (let i = 0; i + 64 <= paramHex.length; i += 64) {
+    if (i === 64) continue; // already tried above
+    try {
+      const val = Number(BigInt('0x' + paramHex.slice(i, i + 64)));
+      if (val >= 1 && val <= 3) return val;
+    } catch (_) {}
+  }
   return null;
 }
 
@@ -677,23 +691,25 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
 
   rememberNftContract(receipt);
 
-  // v10.1: BUY TX — detect tier from calldata param[1] (primary), then
-  // fall back to coordinator/NFT event topics if calldata unavailable.
+  // BUY TX — detect tier from calldata (all param slots) or event topics
   const allMints = findAllNftMints(receipt);
   if (allMints.length) {
     const mintedIds = allMints.map(m => m.nftId);
-    const tier = tierFromCalldata(data) ?? findBuyTierFromLogs(receipt, mintedIds);
+    const cdTier  = tierFromCalldata(data);
+    const logTier = cdTier == null ? findBuyTierFromLogs(receipt, mintedIds) : null;
+    const tier    = cdTier ?? logTier;
     if (tier) {
       for (const m of allMints) {
         nftToTier.set(m.nftId, { tier, buyer: m.to, buyTxHash: txHash, buyTs: blockTs });
       }
       if (!isLoadingHistory || isRecentTx)
-        console.log(`[BUY] tier=${tier}(${TIER_INFO[tier]?.name}) mints=${allMints.length} ids=[${mintedIds.join(',')}] | ${txHash.slice(0,10)}`);
+        console.log(`[BUY] tier=${tier}(${TIER_INFO[tier]?.name}) src=${cdTier?'cd':'log'} mints=${allMints.length} ids=[${mintedIds.join(',')}] sel=${data?.slice(0,10)} | ${txHash.slice(0,10)}`);
     } else {
+      // Log enough detail to diagnose why tier wasn't found
       if (!isLoadingHistory || isRecentTx)
-        console.log(`[BUY ?] tier bilinmiyor mints=${allMints.length} ids=[${mintedIds.join(',')}] | ${txHash.slice(0,10)}`);
+        console.log(`[BUY?] tier bilinmiyor — sel=${data?.slice(0,10)} datalen=${data?.length} mints=${allMints.length} ids=[${mintedIds.join(',')}] | ${txHash.slice(0,10)}`);
     }
-    return; // BUY TX — no notification
+    return;
   }
 
   // CLAIM TX
@@ -701,7 +717,12 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
   const claimer = burn ? burn.from.toLowerCase() : from.toLowerCase();
 
   const { received, src, sources } = collectReceived(receipt, claimer);
-  if (!Object.keys(received).length) return;
+  if (!Object.keys(received).length) {
+    // Log only when there's a confirmed burn so we can spot real misses
+    if (burn && (!isLoadingHistory || isRecentTx))
+      console.log(`[CLAIM?] nft=${burn.nftId} burn ama ERC20 transfer yok claimer=${claimer.slice(0,10)} | ${txHash.slice(0,10)}`);
+    return;
+  }
 
   let claimedNftId = burn?.nftId ?? nftIdFromCalldata(data);
 
@@ -721,8 +742,23 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
     tier = await recoverTierFromBuyTx(claimedNftId);
   }
 
-  // v10.0: silently skip if tier can't be determined (not a $1 scratch card)
-  if (tier === null) return;
+  // v10.4: when tier is still unknown but we have a CONFIRMED burn + real
+  // reward value, send a ❓ notification — never silently drop a real claim.
+  // (Unrelated coordinator events never reach here because they have no burn.)
+  if (tier === null) {
+    if (burn && (!isLoadingHistory || isRecentTx)) {
+      const date   = new Date(blockTs * 1000).toISOString().replace('T', ' ').slice(0, 19) + 'Z';
+      const txUrl  = `https://basescan.org/tx/${txHash}`;
+      const msg = [
+        `❓ Total Value: $${totalUsd.toFixed(2)} [kart #${claimedNftId ?? '?'} — tier bilinmiyor]`,
+        `👤 ${claimer}`,
+        `🕐 ${date} | <a href="${txUrl}">TX</a>`,
+      ].join('\n');
+      console.log(`[?CLAIM] won=$${totalUsd.toFixed(2)} nft=${claimedNftId} map=${nftToTier.size} | ${txHash.slice(0,10)}`);
+      await sendNotification(msg);
+    }
+    return;
+  }
 
   const tierInfo  = TIER_INFO[tier];
   const cycleSize = tierInfo.target;
