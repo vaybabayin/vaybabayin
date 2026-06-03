@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v10.7';
+const VERSION = 'v11.0';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -11,6 +11,9 @@ const SC1_TARGET    = parseInt(process.env.SC1_TARGET || '200');
 const SC2_TARGET    = parseInt(process.env.SC2_TARGET || '200');
 const SC3_TARGET    = parseInt(process.env.SC3_TARGET || '200');
 const COINGECKO_KEY = process.env.COINGECKO_API_KEY || '';
+const ALCHEMY_KEY   = process.env.ALCHEMY_API_KEY   || 'GJQAkDF-FLHo6I32OqUeh';
+const ALCHEMY_HTTP  = `https://base-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
+const ALCHEMY_WSS   = `wss://base-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
 
 if (!TELEGRAM_TOKEN) { console.error('TELEGRAM_BOT_TOKEN eksik!'); process.exit(1); }
 
@@ -25,13 +28,13 @@ const registeredChats = new Set();
 if (CHANNEL_ID) registeredChats.add(String(CHANNEL_ID));
 
 const RPCS = [
+  ALCHEMY_HTTP,
   'https://mainnet.base.org',
   'https://base-rpc.publicnode.com',
   process.env.RPC_URL_1,
   process.env.RPC_URL_2,
   'https://base.gateway.tenderly.co',
   'https://1rpc.io/base',
-  'https://base.blockscout.com/api/eth-rpc',
 ].filter(Boolean);
 
 // v10.0: 3 tiers, all $1 USDC. Tier encoded in coordinator BUY event topics.
@@ -80,6 +83,11 @@ let lastPollBlock = 0;
 let isLoadingHistory = false;
 let _recentTiersPromise = null;
 let _nftContractAddr = (process.env.NFT_CONTRACT || '').toLowerCase() || null;
+
+// WebSocket subscription state
+let wsProvider       = null;
+let wsConnected      = false;
+let wsReconnectTimer = null;
 
 async function getProvider() {
   for (const rpc of RPCS) {
@@ -276,6 +284,9 @@ function rememberNftContract(receipt) {
     if (f === ZERO_ADDRESS || t === ZERO_ADDRESS) {
       _nftContractAddr = log.address.toLowerCase();
       console.log(`[NFT contract] tespit edildi: ${_nftContractAddr}`);
+      if (wsProvider && wsConnected) {
+        try { wsProvider.on({ address: _nftContractAddr }, handleLiveLog); } catch (_) {}
+      }
       ensureRecentTiers().catch(() => {});
       return;
     }
@@ -415,26 +426,8 @@ async function findMintTxBlockscout(nftId) {
   return null;
 }
 
-let _logsProvider     = null;
-let _logsProviderTried = false;
-async function getLogsProvider() {
-  if (_logsProvider) return _logsProvider;
-  if (_logsProviderTried) return null;
-  _logsProviderTried = true;
-  try {
-    const p = new ethers.JsonRpcProvider('https://base.blockscout.com/api/eth-rpc');
-    await Promise.race([
-      p.getBlockNumber(),
-      new Promise((_, r) => setTimeout(() => r(new Error('timeout')), 5000)),
-    ]);
-    _logsProvider = p;
-    console.log('[logsRPC ✓] base.blockscout.com/api/eth-rpc');
-    return p;
-  } catch (e) {
-    console.log(`[logsRPC ✗] ${(e.message || '').slice(0, 80)}`);
-    return null;
-  }
-}
+// Alchemy is already the main provider — use it for logs too.
+function getLogsProvider() { return provider; }
 
 async function _scanLogsForMint(rpcLabel, lp, queryAddr, tokenIdHex, fromZeroTopic, latest, maxLookback, chunk, delayMs) {
   let chunksTried = 0, chunksFailed = 0;
@@ -463,23 +456,20 @@ async function findMintTxOnchain(nftId) {
   if (!_nftContractAddr) return null;
   const tokenIdHex    = '0x' + BigInt(nftId).toString(16).padStart(64, '0');
   const fromZeroTopic = '0x' + '0'.repeat(64);
-  const queryAddr     = _nftContractAddr;
-  const lp = await getLogsProvider();
-  if (lp) {
+  try {
+    const latest = await provider.getBlockNumber();
+    // Try wide-range query first (Alchemy allows larger ranges)
     try {
-      const latest = await lp.getBlockNumber();
-      const logs = await lp.getLogs({
-        address: queryAddr,
+      const logs = await provider.getLogs({
+        address: _nftContractAddr,
         topics: [TRANSFER_TOPIC, fromZeroTopic, null, tokenIdHex],
         fromBlock: Math.max(0, latest - 1_500_000),
         toBlock: latest,
       });
       if (logs.length) return logs[0].transactionHash;
     } catch (_) {}
-  }
-  try {
-    const latest = await provider.getBlockNumber();
-    return await _scanLogsForMint('mainRPC', provider, queryAddr, tokenIdHex, fromZeroTopic, latest, 200_000, 9999, 250);
+    // Fallback: chunked scan
+    return await _scanLogsForMint('mainRPC', provider, _nftContractAddr, tokenIdHex, fromZeroTopic, latest, 200_000, 9999, 250);
   } catch (_) {}
   return null;
 }
@@ -524,33 +514,22 @@ async function ensureRecentTiers() {
   if (!_nftContractAddr) return;
   _recentTiersPromise = (async () => {
     try {
-      const lp = await getLogsProvider();
-      const useLp = lp || provider;
-      const latest = await useLp.getBlockNumber();
+      const latest = await provider.getBlockNumber();
       const fromBlock = Math.max(0, latest - 9000);
       const fromZeroTopic = '0x' + '0'.repeat(64);
       const allHashes = new Set();
 
-      const tryGetLogs = async (rpc, params, label) => {
+      const gatherLogs = async (params) => {
         try {
-          const logs = await rpc.getLogs(params);
+          const logs = await provider.getLogs(params);
           for (const l of logs) allHashes.add(l.transactionHash);
-          return logs.length;
-        } catch (_) {
-          return -1;
-        }
+        } catch (_) {}
       };
 
-      const [n1, n2] = await Promise.all([
-        tryGetLogs(useLp, { address: _nftContractAddr, topics: [TRANSFER_TOPIC, fromZeroTopic], fromBlock, toBlock: latest }, 'bs-mint'),
-        tryGetLogs(useLp, { address: CONTRACT_LOWER, fromBlock, toBlock: latest }, 'bs-coord'),
+      await Promise.all([
+        gatherLogs({ address: _nftContractAddr, topics: [TRANSFER_TOPIC, fromZeroTopic], fromBlock, toBlock: latest }),
+        gatherLogs({ address: CONTRACT_LOWER, fromBlock, toBlock: latest }),
       ]);
-      if (useLp !== provider && (n1 <= 0 || n2 <= 0)) {
-        await Promise.all([
-          n1 <= 0 ? tryGetLogs(provider, { address: _nftContractAddr, topics: [TRANSFER_TOPIC, fromZeroTopic], fromBlock, toBlock: latest }, 'main-mint') : null,
-          n2 <= 0 ? tryGetLogs(provider, { address: CONTRACT_LOWER, fromBlock, toBlock: latest }, 'main-coord') : null,
-        ].filter(Boolean));
-      }
 
       for (const hash of allHashes) {
         try {
@@ -861,39 +840,17 @@ async function diagnoseTx(txHash) {
 async function scanMintLogs(from, to) {
   if (!_nftContractAddr) return [];
   const fromZeroTopic = '0x' + '0'.repeat(64);
-  const lp = await getLogsProvider();
-  const allHashes = new Set();
-  let bsGotResults = false;
-  if (lp) {
-    try {
-      const logs = await lp.getLogs({ address: _nftContractAddr, topics: [TRANSFER_TOPIC, fromZeroTopic], fromBlock: from, toBlock: to });
-      for (const l of logs) allHashes.add(l.transactionHash);
-      if (logs.length > 0) bsGotResults = true;
-    } catch (_) {}
-  }
-  if (!bsGotResults) {
+  try {
     const logs = await provider.getLogs({ address: _nftContractAddr, topics: [TRANSFER_TOPIC, fromZeroTopic], fromBlock: from, toBlock: to });
-    for (const l of logs) allHashes.add(l.transactionHash);
-  }
-  return [...allHashes];
+    return [...new Set(logs.map(l => l.transactionHash))];
+  } catch (_) { return []; }
 }
 
 async function scanCoordinatorLogs(from, to) {
-  const lp = await getLogsProvider();
-  const allHashes = new Set();
-  let bsGotResults = false;
-  if (lp) {
-    try {
-      const logs = await lp.getLogs({ address: CONTRACT_LOWER, fromBlock: from, toBlock: to });
-      for (const l of logs) allHashes.add(l.transactionHash);
-      if (logs.length > 0) bsGotResults = true;
-    } catch (_) {}
-  }
-  if (!bsGotResults) {
+  try {
     const logs = await provider.getLogs({ address: CONTRACT_LOWER, fromBlock: from, toBlock: to });
-    for (const l of logs) allHashes.add(l.transactionHash);
-  }
-  return [...allHashes];
+    return [...new Set(logs.map(l => l.transactionHash))];
+  } catch (_) { return []; }
 }
 
 async function fetchTxBundle(hash) {
@@ -912,6 +869,64 @@ async function fetchTxBundle(hash) {
     if (i < MAX_TRIES - 1) await new Promise(r => setTimeout(r, 500 * (i + 1)));
   }
   return null;
+}
+
+// WebSocket real-time event handler
+async function handleLiveLog(log) {
+  const txHash = log.transactionHash;
+  if (!txHash || processedTxs.has(txHash)) return;
+  try {
+    const bundle = await fetchTxBundle(txHash);
+    if (!bundle) return;
+    await processTx(txHash, bundle.tx.from, bundle.tx.data || '', bundle.receipt.blockNumber, bundle.block?.timestamp || 0);
+  } catch (e) {
+    console.error(`[WS] ${txHash.slice(0,10)}: ${e.message?.slice(0,80)}`);
+  }
+}
+
+async function startWsSubscription() {
+  if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null; }
+  wsConnected = false;
+  if (wsProvider) { try { await wsProvider.destroy(); } catch (_) {} wsProvider = null; }
+
+  try {
+    const wsp = new ethers.WebSocketProvider(ALCHEMY_WSS);
+    await Promise.race([
+      wsp.ready,
+      new Promise((_, r) => setTimeout(() => r(new Error('WS connect timeout')), 15000)),
+    ]);
+
+    wsp.on({ address: CONTRACT_LOWER }, handleLiveLog);
+    if (_nftContractAddr) wsp.on({ address: _nftContractAddr }, handleLiveLog);
+
+    const onDisconnect = () => {
+      if (!wsConnected) return;
+      wsConnected = false;
+      wsProvider  = null;
+      console.log('[WS] Bağlantı kesildi — 5s sonra yeniden bağlanıyor');
+      if (!wsReconnectTimer) wsReconnectTimer = setTimeout(startWsSubscription, 5000);
+    };
+
+    const socket = wsp.websocket;
+    if (socket) {
+      if (typeof socket.on === 'function') {
+        socket.on('close', onDisconnect);
+        socket.on('error', onDisconnect);
+      } else {
+        socket.onclose = onDisconnect;
+        socket.onerror = onDisconnect;
+      }
+    }
+
+    wsProvider  = wsp;
+    wsConnected = true;
+    console.log('[WS ✓] Alchemy WebSocket canlı takip başladı');
+  } catch (e) {
+    wsConnected = false;
+    wsProvider  = null;
+    console.log(`[WS ✗] ${(e.message || '').slice(0, 80)} — 15s sonra yeniden deneniyor`);
+    wsReconnectTimer = setTimeout(startWsSubscription, 15000);
+  }
 }
 
 async function pollLoop() {
@@ -952,7 +967,8 @@ async function pollLoop() {
         lastPollBlock = to;
       }
       fails = 0;
-      await new Promise(r => setTimeout(r, 2500));
+      // When WS is live it handles real-time events; poll is just gap-filler backup.
+      await new Promise(r => setTimeout(r, wsConnected ? 6000 : 2500));
     } catch (e) {
       fails++;
       console.error('[POLL]', e.message.slice(0, 80));
@@ -1082,6 +1098,7 @@ async function main() {
       `✅ <b>Test</b> ${VERSION}`,
       `📡 Kayıtlı chat: ${registeredChats.size}`,
       `📇 NFT map: ${nftToTier.size}`,
+      `🔌 WebSocket: ${wsConnected ? '✅ aktif' : '❌ bağlı değil'}`,
       `🔵 mavi (${SC1_TARGET}): ${ts(1).sessionCount}`,
       `🟢 yeşil (${SC2_TARGET}): ${ts(2).sessionCount}`,
       `🟣 mor (${SC3_TARGET}): ${ts(3).sessionCount}`,
@@ -1124,8 +1141,11 @@ async function main() {
     }
   });
 
-  console.log(`[${VERSION}] başladı | mavi=${SC1_TARGET} yeşil=${SC2_TARGET} mor=${SC3_TARGET} | chat=${registeredChats.size}`);
+  console.log(`[${VERSION}] başladı | mavi=${SC1_TARGET} yeşil=${SC2_TARGET} mor=${SC3_TARGET} | chat=${registeredChats.size} | Alchemy+WS`);
   if (registeredChats.size === 0) console.log(`[UYARI] Kayıtlı chat yok — /track veya /test gönderin.`);
+
+  // Start WebSocket subscription for real-time events (poll loop is backup)
+  startWsSubscription().catch(() => {});
 
   lastPollBlock = 0;
   await pollLoop();
