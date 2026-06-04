@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v11.0';
+const VERSION = 'v11.1';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -50,12 +50,23 @@ const PER_TOKEN_MAX_USD = 100;
 // (paid = 0) have a tier in calldata but no USDC payment — skip them.
 const MIN_PAID_USDC = 0.5;
 
-const TRANSFER_TOPIC    = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+const TRANSFER_TOPIC     = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 // Coordinator event sig prefixes (first 8 bytes of topic[0])
 const BUY_EVENT_PREFIX   = '0x22e804d3';
 const CLAIM_EVENT_PREFIX = '0xd7fd12e8';
 // NFT contract custom event seen in logs (0x73c1e6085df115c7...)
 const NFT_CUSTOM_PREFIX  = '0x73c1e608';
+// ERC-4337 v0.6 EntryPoint handleOps selector
+const EP_HANDLEOPS_SEL   = '0x1fad948c';
+
+// ethers.Interface instance for decoding handleOps (lazy-initialised)
+let _epIface = null;
+function getEpIface() {
+  if (!_epIface) _epIface = new ethers.Interface([
+    'function handleOps((address sender,uint256 nonce,bytes initCode,bytes callData,uint256 callGasLimit,uint256 verificationGasLimit,uint256 preVerificationGas,uint256 maxFeePerGas,uint256 maxPriorityFeePerGas,bytes paymasterAndData,bytes signature)[] ops,address beneficiary)',
+  ]);
+  return _epIface;
+}
 
 const CHAINLINK_ETHUSD = '0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70';
 const WETH             = '0x4200000000000000000000000000000000000006';
@@ -336,32 +347,51 @@ function findNftBurn(receipt) {
   return null;
 }
 
-// v10.4: scan ALL 32-byte parameter slots in calldata for a tier value.
-// Primary: try param[1] first — buy(batchId, tier, seed, nonce, deadline)
-//   selector 0x3e29984c: param[1] at data[74:138].
-// Fallback: scan every other 32-byte slot in case a different function
-//   (e.g. buyAndAssign) puts the tier at a different position.
-// Only returns a value in {1, 2, 3}; skips any slot whose uint256 value
-// falls outside that range.
-function tierFromCalldata(data) {
-  if (!data || data.length < 10) return null;
-  const paramHex = data.slice(10); // skip '0x' + 4-byte selector
-  // Param[1] first (known position for buy())
-  if (paramHex.length >= 128) {
+// Find tier by scanning for (batchId≤10^6, tier∈{1,2,3}, seed≥10^30) triplet.
+// Seed is keccak256-derived, so always >> 10^30. This reliably identifies the
+// (batchId, tier, seed) parameter group regardless of byte alignment or wrapper
+// functions (direct buy(), AA execute wrapper, etc.).
+function findTierByPattern(data) {
+  const hex = (data.startsWith('0x') ? data.slice(2) : data).toLowerCase();
+  const SEED_MIN = BigInt('1' + '0'.repeat(30));
+  for (let i = 0; i + 192 <= hex.length; i += 2) {
     try {
-      const val = Number(BigInt('0x' + paramHex.slice(64, 128)));
-      if (val >= 1 && val <= 3) return val;
-    } catch (_) {}
-  }
-  // Scan all other slots
-  for (let i = 0; i + 64 <= paramHex.length; i += 64) {
-    if (i === 64) continue; // already tried above
-    try {
-      const val = Number(BigInt('0x' + paramHex.slice(i, i + 64)));
-      if (val >= 1 && val <= 3) return val;
+      const tierVal = BigInt('0x' + hex.slice(i + 64, i + 128));
+      if (tierVal < 1n || tierVal > 3n) continue;
+      const batchVal = BigInt('0x' + hex.slice(i, i + 64));
+      if (batchVal > 1_000_000n) continue;
+      const seedVal = BigInt('0x' + hex.slice(i + 128, i + 192));
+      if (seedVal < SEED_MIN) continue;
+      return Number(tierVal);
     } catch (_) {}
   }
   return null;
+}
+
+// Extract tier from calldata. Handles three cases:
+//   1. ERC-4337 handleOps outer TX → decode UserOperation, run pattern scan on inner callData
+//   2. Direct buy() / buyAndAssign() → pattern scan finds (batchId, tier, seed) triplet
+//   3. Any other wrapping → pattern scan on the raw bytes
+function tierFromCalldata(data) {
+  if (!data || data.length < 10) return null;
+  const sel = data.slice(0, 10).toLowerCase();
+
+  if (sel === EP_HANDLEOPS_SEL) {
+    // AA transaction: decode handleOps and scan each UserOperation's inner callData
+    try {
+      const [ops] = getEpIface().decodeFunctionData('handleOps', data);
+      for (const op of ops) {
+        const inner = op.callData ?? op[3];
+        if (!inner || inner === '0x' || inner.length < 10) continue;
+        const t = findTierByPattern(inner);
+        if (t) return t;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  // Direct call (buy/execute wrapper): pattern scan
+  return findTierByPattern(data);
 }
 
 // Fallback: scan coordinator BUY event / NFT custom event topics for a
