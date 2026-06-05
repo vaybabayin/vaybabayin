@@ -3,13 +3,13 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v11.1';
+const VERSION = 'v11.2';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
 const SC1_TARGET    = parseInt(process.env.SC1_TARGET || '200');
 const SC2_TARGET    = parseInt(process.env.SC2_TARGET || '200');
-const SC3_TARGET    = parseInt(process.env.SC3_TARGET || '200');
+const SC3_TARGET    = parseInt(process.env.SC3_TARGET || '250');
 const COINGECKO_KEY = process.env.COINGECKO_API_KEY || '';
 const ALCHEMY_KEY   = process.env.ALCHEMY_API_KEY   || 'GJQAkDF-FLHo6I32OqUeh';
 const ALCHEMY_HTTP  = `https://base-mainnet.g.alchemy.com/v2/${ALCHEMY_KEY}`;
@@ -347,14 +347,28 @@ function findNftBurn(receipt) {
   return null;
 }
 
-// Find tier by scanning for (batchId≤10^6, tier∈{1,2,3}, seed≥10^30) triplet.
-// Seed is keccak256-derived, so always >> 10^30. This reliably identifies the
-// (batchId, tier, seed) parameter group regardless of byte alignment or wrapper
-// functions (direct buy(), AA execute wrapper, etc.).
+// Find tier by locating the buy() parameter block inside ANY calldata.
+//
+// buy(uint64 batchId, uint8 tier, uint256 seed, uint256 nonce, uint256 deadline)
+// is encoded as 5 consecutive 32-byte static slots, so the block appears
+// verbatim no matter how the call is wrapped (EOA direct, smart-contract
+// wallet execute()/executeBatch(), Safe multiSend(), or any ERC-4337 bundler).
+//
+// The scan slides byte-by-byte (handles every wrapper byte-alignment) and
+// validates the FULL signature shape so false positives are impossible:
+//   slot0 batchId  : ≤ 10^6           → 29 leading zero bytes
+//   slot1 tier     : ∈ {1,2,3}
+//   slot2 seed     : ≥ 2^200          → keccak entropy; rejects 20-byte
+//                                        addresses (~2^159) that appear as
+//                                        call targets in batched calldata
+//   slot4 deadline : 10^9 … 10^10     → a unix timestamp (anchor)
+// A random/adversarial blob satisfying all four simultaneously is ~2^-200.
 function findTierByPattern(data) {
   const hex = (data.startsWith('0x') ? data.slice(2) : data).toLowerCase();
-  const SEED_MIN = BigInt('1' + '0'.repeat(30));
-  for (let i = 0; i + 192 <= hex.length; i += 2) {
+  const SEED_MIN     = 1n << 200n;
+  const DEADLINE_MIN = 1_000_000_000n;   // ~2001
+  const DEADLINE_MAX = 10_000_000_000n;  // ~2286
+  for (let i = 0; i + 320 <= hex.length; i += 2) {
     try {
       const tierVal = BigInt('0x' + hex.slice(i + 64, i + 128));
       if (tierVal < 1n || tierVal > 3n) continue;
@@ -362,22 +376,37 @@ function findTierByPattern(data) {
       if (batchVal > 1_000_000n) continue;
       const seedVal = BigInt('0x' + hex.slice(i + 128, i + 192));
       if (seedVal < SEED_MIN) continue;
+      const deadlineVal = BigInt('0x' + hex.slice(i + 256, i + 320));
+      if (deadlineVal < DEADLINE_MIN || deadlineVal > DEADLINE_MAX) continue;
       return Number(tierVal);
     } catch (_) {}
   }
   return null;
 }
 
-// Extract tier from calldata. Handles three cases:
-//   1. ERC-4337 handleOps outer TX → decode UserOperation, run pattern scan on inner callData
-//   2. Direct buy() / buyAndAssign() → pattern scan finds (batchId, tier, seed) triplet
-//   3. Any other wrapping → pattern scan on the raw bytes
+// Extract tier from calldata — wallet-agnostic.
+//
+// The (uint64 batchId, uint8 tier, uint256 seed) triplet is a contiguous run
+// of static-ABI bytes, so it appears VERBATIM in the transaction calldata no
+// matter how the call is wrapped:
+//   • EOA direct buy()
+//   • Smart-contract wallet execute(addr, val, bytes)
+//   • Base App / Coinbase Smart Wallet (executeBatch / multicall)
+//   • Any ERC-4337 bundler (handleOps v0.6 / v0.7 PackedUserOperation)
+//
+// Strategy:
+//   1. If it's an EntryPoint handleOps call, try to decode and scan each
+//      UserOperation's inner callData first (most precise).
+//   2. ALWAYS fall back to a raw byte-pattern scan over the entire calldata.
+//      The batchId ≤ 10^6 constraint forces 29 leading zero bytes in that
+//      slot, so a false positive in arbitrary data (e.g. a signature blob) is
+//      astronomically unlikely (~256^-29). This makes detection robust for
+//      every wallet/bundler type, even ones whose ABI we cannot decode.
 function tierFromCalldata(data) {
   if (!data || data.length < 10) return null;
   const sel = data.slice(0, 10).toLowerCase();
 
   if (sel === EP_HANDLEOPS_SEL) {
-    // AA transaction: decode handleOps and scan each UserOperation's inner callData
     try {
       const [ops] = getEpIface().decodeFunctionData('handleOps', data);
       for (const op of ops) {
@@ -387,10 +416,10 @@ function tierFromCalldata(data) {
         if (t) return t;
       }
     } catch (_) {}
-    return null;
+    // Decode failed (unknown UserOp layout) → universal raw scan below.
   }
 
-  // Direct call (buy/execute wrapper): pattern scan
+  // Universal fallback: scan the full raw calldata for the triplet.
   return findTierByPattern(data);
 }
 
@@ -768,7 +797,7 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
     `${tierInfo.emoji} Total Value: $${totalUsd.toFixed(2)} [${tierInfo.name}]`,
     `📍 Döngü: ${posInCycle}/${cycleSize} (~${remaining} kaldı) — Döngü Avg: $${cycleAvg.toFixed(2)}`,
     `🔴 Streak: ${state.streak}`,
-    isJackpot ? `🎰 Jackpot ${state.jackpotCycleCount}/${jackpotTotal}` : null,
+    `🎰 Jackpot: ${state.jackpotCycleCount}/${jackpotTotal}${isJackpot ? ' 🎉 JACKPOT!' : ''}`,
     avgLine ? `📊 ${avgLine}` : null,
     `👤 ${claimer}`,
     `🕐 ${date} | <a href="${txUrl}">TX</a>`,
@@ -1046,9 +1075,9 @@ async function startConversation(chatId) {
     '✅ Bu chat bildirim listesine eklendi.',
     '',
     '📊 Döngü Sayıcıları:',
-    `  • 🔵 mavi: Kaç tane açıldı? (?/200)`,
-    `  • 🟢 yeşil: Kaç tane açıldı? (?/200)`,
-    `  • 🟣 mor: Kaç tane açıldı? (?/200)`,
+    `  • 🔵 mavi: Kaç tane açıldı? (?/${SC1_TARGET})`,
+    `  • 🟢 yeşil: Kaç tane açıldı? (?/${SC2_TARGET})`,
+    `  • 🟣 mor: Kaç tane açıldı? (?/${SC3_TARGET})`,
     '',
     '💬 Sırayla cevapla',
   ];
