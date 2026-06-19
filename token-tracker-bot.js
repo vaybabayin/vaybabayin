@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v11.2';
+const VERSION = 'v11.3';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -49,6 +49,10 @@ const PER_TOKEN_MAX_USD = 100;
 // v10.5: only notify for packages bought with ~1 USDC. Free packages
 // (paid = 0) have a tier in calldata but no USDC payment — skip them.
 const MIN_PAID_USDC = 0.5;
+
+// Runtime-mutable cycle size for mor (tier 3). Overridden via /start.
+let sc3CycleOverride = SC3_TARGET;
+function getCycleSize(tier) { return tier === 3 ? sc3CycleOverride : TIER_INFO[tier].target; }
 
 const TRANSFER_TOPIC     = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 // Coordinator event sig prefixes (first 8 bytes of topic[0])
@@ -755,7 +759,7 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
   if (tier === null) return;
 
   const tierInfo  = TIER_INFO[tier];
-  const cycleSize = tierInfo.target;
+  const cycleSize = getCycleSize(tier);
   const state = ts(tier);
 
   if (state.history.length > 0) {
@@ -1040,7 +1044,7 @@ async function pollLoop() {
 function buildTierMsg(tierNum) {
   const state     = ts(tierNum);
   const tierInfo  = TIER_INFO[tierNum];
-  const cycleSize = tierInfo.target;
+  const cycleSize = getCycleSize(tierNum);
   const pos       = state.sessionCount > 0 ? state.sessionCount : state.count;
   if (!pos) return `${tierInfo.emoji} Henüz ${tierInfo.name} kaydı yok.`;
   const posInCycle = ((pos - 1) % cycleSize) + 1;
@@ -1077,14 +1081,13 @@ async function startConversation(chatId) {
     '📊 Döngü Sayıcıları:',
     `  • 🔵 mavi: Kaç tane açıldı? (?/${SC1_TARGET})`,
     `  • 🟢 yeşil: Kaç tane açıldı? (?/${SC2_TARGET})`,
-    `  • 🟣 mor: Kaç tane açıldı? (?/${SC3_TARGET})`,
+    `  • 🟣 mor: Seri kaç paketlik? + Kaç tane açıldı?`,
     '',
     '💬 Sırayla cevapla',
   ];
   await bot.sendMessage(chatId, lines.join('\n'), { parse_mode: 'HTML' });
-  conversations[chatId] = { step: 0, data: {} };
-  const first = TIER_INFO[TIERS_ORDER[0]];
-  await bot.sendMessage(chatId, `${first.emoji} ${first.name}: Kaç tane açıldı? (?/${first.target})`);
+  conversations[chatId] = { step: 'tier1', data: {} };
+  await bot.sendMessage(chatId, `🔵 mavi: Kaç tane açıldı? (?/${SC1_TARGET})`);
 }
 
 async function handleConversationReply(chatId, text) {
@@ -1095,21 +1098,34 @@ async function handleConversationReply(chatId, text) {
     await bot.sendMessage(chatId, '❌ Geçerli bir sayı girin (örn: 45)');
     return;
   }
-  const tierNum = TIERS_ORDER[conv.step];
-  conv.data[tierNum] = n;
-  conv.step++;
-  if (conv.step < TIERS_ORDER.length) {
-    const next = TIER_INFO[TIERS_ORDER[conv.step]];
-    await bot.sendMessage(chatId, `${next.emoji} ${next.name}: Kaç tane açıldı? (?/${next.target})`);
-  } else {
+
+  if (conv.step === 'tier1') {
+    conv.data[1] = n;
+    conv.step = 'tier2';
+    await bot.sendMessage(chatId, `🟢 yeşil: Kaç tane açıldı? (?/${SC2_TARGET})`);
+  } else if (conv.step === 'tier2') {
+    conv.data[2] = n;
+    conv.step = 'mor_size';
+    await bot.sendMessage(chatId, `🟣 mor: Seri kaç paketlik? (varsayılan: ${sc3CycleOverride})`);
+  } else if (conv.step === 'mor_size') {
+    conv.data.sc3Size = n > 0 ? n : sc3CycleOverride;
+    conv.step = 'mor_opened';
+    await bot.sendMessage(chatId, `🟣 mor: Kaç tane açıldı? (?/${conv.data.sc3Size})`);
+  } else if (conv.step === 'mor_opened') {
+    conv.data[3] = n;
     delete conversations[chatId];
-    for (const t of TIERS_ORDER)
-      if (conv.data[t] !== undefined) ts(t).sessionCount = conv.data[t];
+
+    ts(1).sessionCount = conv.data[1];
+    ts(2).sessionCount = conv.data[2];
+    sc3CycleOverride   = conv.data.sc3Size;
+    ts(3).sessionCount = conv.data[3];
+
     const lines = ['✅ Döngü Sayıcıları Ayarlandı:'];
     for (const t of TIERS_ORDER) {
       const info = TIER_INFO[t];
+      const size = getCycleSize(t);
       const avg  = overallAvg(t);
-      lines.push(`  • ${info.emoji} ${info.name}: ${ts(t).sessionCount}/${info.target} (ort: ${avg !== null ? '$'+avg.toFixed(2) : 'N/A'})`);
+      lines.push(`  • ${info.emoji} ${info.name}: ${ts(t).sessionCount}/${size} (ort: ${avg !== null ? '$'+avg.toFixed(2) : 'N/A'})`);
     }
     lines.push('', '💡 Yeni paket gelince sayıç otomatik ilerleyecek.');
     await bot.sendMessage(chatId, lines.join('\n'), { parse_mode: 'HTML' });
@@ -1160,7 +1176,7 @@ async function main() {
       `🔌 WebSocket: ${wsConnected ? '✅ aktif' : '❌ bağlı değil'}`,
       `🔵 mavi (${SC1_TARGET}): ${ts(1).sessionCount}`,
       `🟢 yeşil (${SC2_TARGET}): ${ts(2).sessionCount}`,
-      `🟣 mor (${SC3_TARGET}): ${ts(3).sessionCount}`,
+      `🟣 mor (${sc3CycleOverride}): ${ts(3).sessionCount}`,
     ];
     await bot.sendMessage(msg.chat.id, lines.join('\n'), { parse_mode: 'HTML' });
   });
@@ -1200,7 +1216,7 @@ async function main() {
     }
   });
 
-  console.log(`[${VERSION}] başladı | mavi=${SC1_TARGET} yeşil=${SC2_TARGET} mor=${SC3_TARGET} | chat=${registeredChats.size} | Alchemy+WS`);
+  console.log(`[${VERSION}] başladı | mavi=${SC1_TARGET} yeşil=${SC2_TARGET} mor=${sc3CycleOverride} | chat=${registeredChats.size} | Alchemy+WS`);
   if (registeredChats.size === 0) console.log(`[UYARI] Kayıtlı chat yok — /track veya /test gönderin.`);
 
   // Start WebSocket subscription for real-time events (poll loop is backup)
