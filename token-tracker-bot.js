@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v11.4';
+const VERSION = 'v11.5';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -38,12 +38,14 @@ const RPCS = [
 ].filter(Boolean);
 
 // v10.0: 3 tiers, all $1 USDC. Tier encoded in coordinator BUY event topics.
-// jackpotUsd: center value; ±20% window used for detection.
-// jackpotTotal: expected jackpots per 200-cycle.
+// v11.5: jackpot detection uses a fixed Total-Value band per tier:
+//   mavi  $4–8   ·  yeşil $7–15  ·  mor $15–30  (inclusive).
+// Any claim whose Total Value falls in the band counts as a jackpot.
+// jackpotTotal: expected jackpots per cycle.
 const TIER_INFO = {
-  1: { name: 'mavi',  emoji: '🔵', payUsd: 1, target: SC1_TARGET, jackpotUsd: 5,  jackpotTotal: 6 },
-  2: { name: 'yeşil', emoji: '🟢', payUsd: 1, target: SC2_TARGET, jackpotUsd: 10, jackpotTotal: 4 },
-  3: { name: 'mor',   emoji: '🟣', payUsd: 1, target: SC3_TARGET, jackpotUsd: 20, jackpotTotal: 3 },
+  1: { name: 'mavi',  emoji: '🔵', payUsd: 1, target: SC1_TARGET, jackpotMin: 4,  jackpotMax: 8,  jackpotTotal: 6 },
+  2: { name: 'yeşil', emoji: '🟢', payUsd: 1, target: SC2_TARGET, jackpotMin: 7,  jackpotMax: 15, jackpotTotal: 4 },
+  3: { name: 'mor',   emoji: '🟣', payUsd: 1, target: SC3_TARGET, jackpotMin: 15, jackpotMax: 30, jackpotTotal: 3 },
 };
 const PER_TOKEN_MAX_USD = 100;
 // v10.5: only notify for packages bought with ~1 USDC. Free packages
@@ -51,14 +53,14 @@ const PER_TOKEN_MAX_USD = 100;
 const MIN_PAID_USDC = 0.5;
 
 // v11.4: A single prize token can't plausibly be worth more than the whole
-// card's jackpot. When a DEX source returns a bad (dust/scam-pool) price, one
-// mispriced token can dominate Total Value — e.g. a $1 mavi card showing $8.63
-// because KAITO was priced ~40x too high. Any token whose value exceeds this
-// ceiling is re-priced from on-chain pools (reserve-based, reliable) and, if
-// still implausible, dropped as an outlier.
+// card's max jackpot. When a DEX source returns a bad (dust/scam-pool) price,
+// one mispriced token can dominate Total Value — e.g. a $1 mavi card showing
+// $8.63 because KAITO was priced ~40x too high. Any token whose value exceeds
+// this ceiling is re-priced from on-chain pools (reserve-based, reliable) and,
+// if still implausible, dropped as an outlier.
 function perTokenCapUsd(tier) {
-  const j = tier && TIER_INFO[tier] ? TIER_INFO[tier].jackpotUsd : 20;
-  return j * 1.5; // mavi $7.5 · yeşil $15 · mor $30 · unknown $30
+  const t = tier && TIER_INFO[tier] ? TIER_INFO[tier] : null;
+  return t ? t.jackpotMax : 30; // mavi $8 · yeşil $15 · mor $30 · unknown $30
 }
 
 // Runtime-mutable cycle size for mor (tier 3). Overridden via /start.
@@ -832,10 +834,11 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
   const cycleSlice = state.history.slice(0, posInCycle);
   const cycleAvg   = cycleSlice.reduce((s, c) => s + c.usd, 0) / (cycleSlice.length || 1);
 
-  // Jackpot detection: totalUsd within ±20% of tier's jackpot center value.
+  // Jackpot detection: totalUsd within the tier's fixed band (v11.5).
+  //   mavi $4–8 · yeşil $7–15 · mor $15–30 (inclusive).
   // Reset per-cycle counter when a new cycle begins (posInCycle wraps to 1).
-  const { jackpotUsd, jackpotTotal } = tierInfo;
-  const isJackpot = totalUsd >= jackpotUsd * 0.8 && totalUsd <= jackpotUsd * 1.2;
+  const { jackpotMin, jackpotMax, jackpotTotal } = tierInfo;
+  const isJackpot = totalUsd >= jackpotMin && totalUsd <= jackpotMax;
   if (posInCycle === 1 && pos > 1) state.jackpotCycleCount = 0; // new cycle
   if (isJackpot) state.jackpotCycleCount++;
 
