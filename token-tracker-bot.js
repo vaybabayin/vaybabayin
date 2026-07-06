@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v11.3';
+const VERSION = 'v11.4';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -49,6 +49,17 @@ const PER_TOKEN_MAX_USD = 100;
 // v10.5: only notify for packages bought with ~1 USDC. Free packages
 // (paid = 0) have a tier in calldata but no USDC payment — skip them.
 const MIN_PAID_USDC = 0.5;
+
+// v11.4: A single prize token can't plausibly be worth more than the whole
+// card's jackpot. When a DEX source returns a bad (dust/scam-pool) price, one
+// mispriced token can dominate Total Value — e.g. a $1 mavi card showing $8.63
+// because KAITO was priced ~40x too high. Any token whose value exceeds this
+// ceiling is re-priced from on-chain pools (reserve-based, reliable) and, if
+// still implausible, dropped as an outlier.
+function perTokenCapUsd(tier) {
+  const j = tier && TIER_INFO[tier] ? TIER_INFO[tier].jackpotUsd : 20;
+  return j * 1.5; // mavi $7.5 · yeşil $15 · mor $30 · unknown $30
+}
 
 // Runtime-mutable cycle size for mor (tier 3). Overridden via /start.
 let sc3CycleOverride = SC3_TARGET;
@@ -180,8 +191,26 @@ async function dsPrice(address) {
       .map(p => ({ price: parseFloat(p.priceUsd), liq: Number(p.liquidity?.usd) || 0 }))
       .sort((a, b) => b.liq - a.liq);
     if (!pairs.length) return null;
-    return pairs[0].price;
+    // v11.4: prefer pools with real liquidity. A dust/scam pool can report a
+    // wildly wrong priceUsd (e.g. a token 40x too high), which poisons the
+    // total. Use the deepest pool over $1k; fall back to the deepest overall
+    // only if none clear the bar (so a legit thin token isn't lost).
+    const DUST_LIQ_USD = 1000;
+    const deep = pairs.filter(p => p.liq >= DUST_LIQ_USD);
+    return (deep.length ? deep[0] : pairs[0]).price;
   } catch (_) { return null; }
+}
+
+// On-chain price only (Uniswap v3 → Aerodrome), bypassing DEX aggregators.
+// Pool reserves/slot0 are on-chain truth and can't be spoofed by a scam pool,
+// so this is used to re-price a token whose aggregator value looks implausible.
+async function onchainPriceUsd(address, decimals) {
+  if (decimals == null) {
+    try { decimals = (await getTokenInfo(address)).decimals; } catch (_) { decimals = 18; }
+  }
+  let p = await uniPrice(address, decimals);
+  if (!p) p = await aeroPrice(address, decimals);
+  return p || null;
 }
 
 async function uniPrice(address, decimals) {
@@ -657,21 +686,39 @@ function collectReceived(receipt, recipient) {
   return { received: fromOther, usedFallback: true, src: 'other', sources: {} };
 }
 
-async function calcTotalUsd(received, sources) {
+async function calcTotalUsd(received, sources, capUsd = PER_TOKEN_MAX_USD) {
   let totalUsd = 0;
   const tokenSummary = [];
   const tokenDetail  = [];
   const droppedSummary = [];
 
-  const addPriced = (addr, info, human, price, label) => {
-    const usd = human * price;
-    if (usd < 0.0001) return;
-    if (usd > PER_TOKEN_MAX_USD) { droppedSummary.push(`${info.symbol}=$${usd.toFixed(2)}(OUTLIER)`); return; }
+  const commit = (addr, info, human, price, label) => {
+    const usd  = human * price;
     const psrc = priceCache[addr.toLowerCase()]?.src || '?';
     const fsrc = sources && sources[addr] ? Array.from(sources[addr]).sort().join('') : '?';
     totalUsd += usd;
     tokenSummary.push(`${info.symbol}=$${usd.toFixed(4)}`);
     tokenDetail.push(`${info.symbol}[${fsrc}] ${human.toFixed(6)} @ $${price.toFixed(8)}[${psrc}${label}] = $${usd.toFixed(4)}`);
+  };
+
+  const addPriced = async (addr, info, human, price, label) => {
+    const usd = human * price;
+    if (usd < 0.0001) return;
+    if (usd > capUsd) {
+      // Implausibly high for one prize token — the aggregator price is likely
+      // from a dust/scam pool. Re-price from on-chain reserves and use that if
+      // it's sane; otherwise drop the token as an outlier (a tiny undercount is
+      // far better than an 8x overcount).
+      const onchain = await onchainPriceUsd(addr, info.decimals);
+      if (onchain && human * onchain <= capUsd) {
+        priceCache[addr.toLowerCase()] = { price: onchain, at: Date.now(), src: 'onchain' };
+        commit(addr, info, human, onchain, label ? `${label},fix` : 'fix');
+        return;
+      }
+      droppedSummary.push(`${info.symbol}=$${usd.toFixed(2)}(OUTLIER>$${capUsd})`);
+      return;
+    }
+    commit(addr, info, human, price, label);
   };
 
   const pending = [];
@@ -681,7 +728,7 @@ async function calcTotalUsd(received, sources) {
       const human = Number(ethers.formatUnits(rawAmt, info.decimals));
       const price = await getTokenPriceUsd(addr);
       if (!price) { pending.push({ addr, info, human }); continue; }
-      addPriced(addr, info, human, price, '');
+      await addPriced(addr, info, human, price, '');
     } catch (_) {}
   }
 
@@ -692,7 +739,7 @@ async function calcTotalUsd(received, sources) {
         delete priceCache[addr.toLowerCase()];
         const price = await getTokenPriceUsd(addr);
         if (!price) { droppedSummary.push(`${info.symbol}=NO_PRICE`); continue; }
-        addPriced(addr, info, human, price, '*retry');
+        await addPriced(addr, info, human, price, '*retry');
       } catch (_) {}
     }
   }
@@ -745,7 +792,7 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
   let entry = claimedNftId ? nftToTier.get(claimedNftId) : null;
   let tier = entry?.tier ?? null;
 
-  const { totalUsd } = await calcTotalUsd(received, sources);
+  const { totalUsd } = await calcTotalUsd(received, sources, perTokenCapUsd(tier));
   if (totalUsd <= 0) return;
 
   if (tier === null && claimedNftId && (!isLoadingHistory || isRecentTx)) {
@@ -852,7 +899,8 @@ async function diagnoseTx(txHash) {
     const { received, src, sources } = collectReceived(receipt, tx.from.toLowerCase());
     lines.push(`💸 Recipient transferi: ${Object.keys(received).length} (src=${src})`);
     if (Object.keys(received).length) {
-      const { totalUsd, tokenDetail, droppedSummary } = await calcTotalUsd(received, sources);
+      const diagTier = burn && nftToTier.has(burn.nftId) ? nftToTier.get(burn.nftId).tier : null;
+      const { totalUsd, tokenDetail, droppedSummary } = await calcTotalUsd(received, sources, perTokenCapUsd(diagTier));
       for (const t of tokenDetail)    lines.push(`  ✓ ${t}`);
       for (const d of droppedSummary) lines.push(`  ✗ ${d}`);
       lines.push(`💰 Toplam: $${totalUsd.toFixed(4)}`);
