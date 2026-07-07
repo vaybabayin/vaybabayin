@@ -3,7 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v11.5';
+const VERSION = 'v11.6';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
@@ -52,12 +52,11 @@ const PER_TOKEN_MAX_USD = 100;
 // (paid = 0) have a tier in calldata but no USDC payment — skip them.
 const MIN_PAID_USDC = 0.5;
 
-// v11.4: A single prize token can't plausibly be worth more than the whole
-// card's max jackpot. When a DEX source returns a bad (dust/scam-pool) price,
-// one mispriced token can dominate Total Value — e.g. a $1 mavi card showing
-// $8.63 because KAITO was priced ~40x too high. Any token whose value exceeds
-// this ceiling is re-priced from on-chain pools (reserve-based, reliable) and,
-// if still implausible, dropped as an outlier.
+// v11.4/v11.6: a normal prize token for a tier is worth roughly its $1 share.
+// Anything far above the tier's max jackpot is SUSPICIOUS — either a genuine
+// jackpot prize or a bad (dust/scam-pool) aggregator price. This threshold is
+// the trigger to double-check a token against on-chain reserves before trusting
+// it; it is NOT a hard drop (see calcTotalUsd).
 function perTokenCapUsd(tier) {
   const t = tier && TIER_INFO[tier] ? TIER_INFO[tier] : null;
   return t ? t.jackpotMax : 30; // mavi $8 · yeşil $15 · mor $30 · unknown $30
@@ -707,17 +706,23 @@ async function calcTotalUsd(received, sources, capUsd = PER_TOKEN_MAX_USD) {
     const usd = human * price;
     if (usd < 0.0001) return;
     if (usd > capUsd) {
-      // Implausibly high for one prize token — the aggregator price is likely
-      // from a dust/scam pool. Re-price from on-chain reserves and use that if
-      // it's sane; otherwise drop the token as an outlier (a tiny undercount is
-      // far better than an 8x overcount).
+      // Higher than a normal prize token for this tier. This is EITHER a real
+      // jackpot prize OR an aggregator price coming from a dust/scam pool.
+      // Consult on-chain reserves (Uniswap/Aerodrome) — the ground truth a fake
+      // pool can't spoof — and INCLUDE the token at that verified price.
+      //   • Genuine jackpot prize (e.g. SCRATCH): on-chain confirms its value →
+      //     it counts toward Total Value, so jackpots actually trigger.
+      //   • KAITO-style 40x misprice: on-chain reveals the real (low) price →
+      //     corrected down instead of inflating the total.
+      // Only drop when the token can't be verified on-chain at all, or even the
+      // on-chain price is absurd (> $100 absolute backstop) — i.e. unreliable.
       const onchain = await onchainPriceUsd(addr, info.decimals);
-      if (onchain && human * onchain <= capUsd) {
+      if (onchain && human * onchain <= PER_TOKEN_MAX_USD) {
         priceCache[addr.toLowerCase()] = { price: onchain, at: Date.now(), src: 'onchain' };
-        commit(addr, info, human, onchain, label ? `${label},fix` : 'fix');
+        commit(addr, info, human, onchain, label ? `${label},chk` : 'chk');
         return;
       }
-      droppedSummary.push(`${info.symbol}=$${usd.toFixed(2)}(OUTLIER>$${capUsd})`);
+      droppedSummary.push(`${info.symbol}=$${usd.toFixed(2)}(OUTLIER>$${capUsd}, doğrulanamadı)`);
       return;
     }
     commit(addr, info, human, price, label);
