@@ -5,7 +5,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v11.7';
+const VERSION = 'v11.8';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 // One or more chat IDs, comma-separated. Chats listed here survive redeploys
 // without anyone having to send /start again.
@@ -502,6 +502,12 @@ function findNftBurn(receipt) {
 //   slot4 deadline : 10^9 … 10^10     → a unix timestamp (anchor)
 // A random/adversarial blob satisfying all four simultaneously is ~2^-200.
 function findTierByPattern(data) {
+  return findBuyByPattern(data)?.tier ?? null;
+}
+
+// Same scan, returning both buy() parameters that identify the series:
+// { tier, batchId }.
+function findBuyByPattern(data) {
   const hex = (data.startsWith('0x') ? data.slice(2) : data).toLowerCase();
   const SEED_MIN     = 1n << 200n;
   const DEADLINE_MIN = 1_000_000_000n;   // ~2001
@@ -516,7 +522,7 @@ function findTierByPattern(data) {
       if (seedVal < SEED_MIN) continue;
       const deadlineVal = BigInt('0x' + hex.slice(i + 256, i + 320));
       if (deadlineVal < DEADLINE_MIN || deadlineVal > DEADLINE_MAX) continue;
-      return Number(tierVal);
+      return { tier: Number(tierVal), batchId: Number(batchVal) };
     } catch (_) {}
   }
   return null;
@@ -541,6 +547,12 @@ function findTierByPattern(data) {
 //      astronomically unlikely (~256^-29). This makes detection robust for
 //      every wallet/bundler type, even ones whose ABI we cannot decode.
 function tierFromCalldata(data) {
+  const buy = buyFromCalldata(data);
+  if (buy) noteBatch(buy);
+  return buy?.tier ?? null;
+}
+
+function buyFromCalldata(data) {
   if (!data || data.length < 10) return null;
   const sel = data.slice(0, 10).toLowerCase();
 
@@ -550,15 +562,22 @@ function tierFromCalldata(data) {
       for (const op of ops) {
         const inner = op.callData ?? op[3];
         if (!inner || inner === '0x' || inner.length < 10) continue;
-        const t = findTierByPattern(inner);
-        if (t) return t;
+        const b = findBuyByPattern(inner);
+        if (b) return b;
       }
     } catch (_) {}
     // Decode failed (unknown UserOp layout) → universal raw scan below.
   }
 
   // Universal fallback: scan the full raw calldata for the triplet.
-  return findTierByPattern(data);
+  return findBuyByPattern(data);
+}
+
+// Newest series (batchId) seen per tier in buy() calls. Used as the argument
+// when probing the coordinator's per-series view functions (/kontrat).
+const latestBatch = { 1: null, 2: null, 3: null };
+function noteBatch({ tier, batchId }) {
+  if (latestBatch[tier] === null || batchId > latestBatch[tier]) latestBatch[tier] = batchId;
 }
 
 // Fallback: scan coordinator BUY event / NFT custom event topics for a
@@ -706,6 +725,7 @@ async function ensureRecentTiers() {
   if (!_nftContractAddr) return;
   _recentTiersPromise = (async () => {
     try {
+      tierScanStatus = 'log taranıyor';
       const latest = await provider.getBlockNumber();
       const fromBlock = Math.max(0, latest - 9000);
       const fromZeroTopic = '0x' + '0'.repeat(64);
@@ -714,6 +734,7 @@ async function ensureRecentTiers() {
         { address: _nftContractAddr, topics: [TRANSFER_TOPIC, fromZeroTopic] }, fromBlock, latest);
       const allHashes = new Set(mintLogs.map(l => l.transactionHash));
       console.log(`[TIER] geçmiş tarama: ${allHashes.size} buy tx (son 9000 blok)`);
+      tierScanStatus = `${allHashes.size} buy işleniyor`;
 
       for (const hash of allHashes) {
         try {
@@ -735,13 +756,109 @@ async function ensureRecentTiers() {
           }
         } catch (_) {}
       }
+      tierScanStatus = `bitti (${allHashes.size} buy)`;
     } catch (e) {
+      tierScanStatus = `hata: ${(e.message || '').slice(0, 60)}`;
+      console.error('[TIER] geçmiş tarama hatası:', e.message);
       _recentTiersPromise = null;
       throw e;
     }
   })();
   try { await _recentTiersPromise; } catch (_) {}
   return _recentTiersPromise;
+}
+
+let tierScanStatus = 'başlamadı';
+
+// ── /kontrat: contract discovery ─────────────────────────────────────────
+// Reads the verified ABI of the coordinator (and its implementation if it is
+// a proxy) and of the NFT contract from Blockscout, lists every read-only
+// function and calls the ones that take no argument, a tier (1–3) or a series
+// id (the newest batchId seen in buy() per tier). Used to find where the
+// contract keeps how many packages a series has and how many are sold.
+async function fetchVerifiedAbi(addr) {
+  const r = await axios.get(`https://base.blockscout.com/api/v2/smart-contracts/${addr}`, { timeout: 15000 });
+  const d = r.data || {};
+  const impls = [
+    ...(d.implementations || []).map(i => i.address || i.address_hash),
+    d.implementation_address,
+  ].filter(a => a && a.toLowerCase() !== addr.toLowerCase());
+  let abi = Array.isArray(d.abi) ? d.abi : [];
+  const names = [d.name || '?'];
+  for (const impl of [...new Set(impls)]) {
+    try {
+      const ri = await axios.get(`https://base.blockscout.com/api/v2/smart-contracts/${impl}`, { timeout: 15000 });
+      if (Array.isArray(ri.data?.abi)) abi = abi.concat(ri.data.abi);
+      names.push(`impl ${ri.data?.name || '?'} ${impl}`);
+    } catch (e) { names.push(`impl ${impl} (ABI alınamadı: ${e.message})`); }
+  }
+  return { abi, names, verified: d.is_verified !== false && abi.length > 0 };
+}
+
+const fmtResult = (v) => JSON.stringify(v, (_, x) => typeof x === 'bigint' ? x.toString() : x);
+
+function probeArgs(input) {
+  const t = input.type, n = (input.name || '').toLowerCase();
+  if (!/^u?int\d*$/.test(t)) return null;
+  const batches = [1, 2, 3].map(tr => latestBatch[tr]).filter(b => b !== null);
+  if (/batch|series|seri|round|id/.test(n) && batches.length) return [...new Set(batches)];
+  return [1, 2, 3];
+}
+
+async function probeContract(label, addr) {
+  const lines = [`━━ ${label} ${addr}`];
+  let info;
+  try { info = await fetchVerifiedAbi(addr); }
+  catch (e) { return lines.concat(`❌ Blockscout ABI alınamadı: ${e.message}`); }
+  lines.push(`Ad: ${info.names.join(' | ')}`);
+  if (!info.verified) return lines.concat('❌ Kontrat doğrulanmamış (ABI yok)');
+
+  // Proxy + implementation ABIs overlap; keep one fragment per signature.
+  const views = [...new Map(info.abi
+    .filter(f => f.type === 'function' && ['view', 'pure'].includes(f.stateMutability))
+    .map(f => [`${f.name}(${(f.inputs || []).map(i => i.type).join(',')})`, f])).values()];
+  lines.push(`Okuma fonksiyonu: ${views.length}`);
+  const c = new ethers.Contract(addr, views, provider);
+  for (const f of views) {
+    const key = `${f.name}(${(f.inputs || []).map(i => i.type).join(',')})`;
+    const sig = `${f.name}(${(f.inputs || []).map(i => `${i.type} ${i.name || ''}`.trim()).join(', ')})`;
+    const outs = (f.outputs || []).map(o => `${o.type}${o.name ? ' ' + o.name : ''}`).join(', ');
+    const argSets = (f.inputs || []).length === 0 ? [[]]
+      : (f.inputs.length === 1 && probeArgs(f.inputs[0])) ? probeArgs(f.inputs[0]).map(a => [a]) : null;
+    if (!argSets) { lines.push(`• ${sig} → (${outs}) [çağrılmadı]`); continue; }
+    const results = [];
+    for (const args of argSets) {
+      try {
+        const fn = c.getFunction(key);
+        const v = await Promise.race([fn.staticCall(...args), sleep(8000).then(() => { throw new Error('timeout'); })]);
+        results.push(`${args.length ? args[0] + ': ' : ''}${fmtResult(v).slice(0, 160)}`);
+      } catch (e) { results.push(`${args.length ? args[0] + ': ' : ''}hata ${(e.shortMessage || e.message || '').slice(0, 50)}`); }
+    }
+    lines.push(`• ${sig} → (${outs})\n    ${results.join('\n    ')}`);
+  }
+  return lines;
+}
+
+async function probeContracts() {
+  const head = [
+    `🔎 Kontrat keşfi ${VERSION}`,
+    `Son görülen seri (batchId): mavi=${latestBatch[1] ?? '?'} yeşil=${latestBatch[2] ?? '?'} mor=${latestBatch[3] ?? '?'}`,
+  ];
+  const coord = await probeContract('COORDINATOR', CONTRACT);
+  const nft   = _nftContractAddr ? await probeContract('NFT', _nftContractAddr) : [];
+  return head.concat(coord, nft).join('\n');
+}
+
+// Telegram caps messages at 4096 chars; split on line boundaries.
+function chunkText(text, max = 3900) {
+  const out = [];
+  let cur = '';
+  for (const line of text.split('\n')) {
+    if (cur.length + line.length + 1 > max) { out.push(cur); cur = ''; }
+    cur += (cur ? '\n' : '') + line.slice(0, max);
+  }
+  if (cur) out.push(cur);
+  return out;
 }
 
 function nftIdFromCalldata(data) {
@@ -1371,6 +1488,7 @@ async function main() {
       '/sc1 — 🔵 Mavi istatistikleri',
       '/sc2 — 🟢 Yeşil istatistikleri',
       '/sc3 — 🟣 Mor istatistikleri',
+      '/kontrat — Kontratın okuma fonksiyonlarını ve değerlerini göster',
       '/komut — Bu listeyi göster',
       '/diag &lt;TX_HASH&gt; — TX analizi',
     ];
@@ -1382,7 +1500,8 @@ async function main() {
     const lines = [
       `✅ <b>Test</b> ${VERSION}`,
       `📡 Kayıtlı chat: ${registeredChats.size} (bu chat: <code>${msg.chat.id}</code>)`,
-      `📇 NFT map: ${nftToTier.size}`,
+      `📇 NFT map: ${nftToTier.size} | Geçmiş tarama: ${tierScanStatus} (getLogs aralığı ${logsSpan})`,
+      `🗂 Son seri (batchId): mavi=${latestBatch[1] ?? '?'} yeşil=${latestBatch[2] ?? '?'} mor=${latestBatch[3] ?? '?'}`,
       `🔌 WebSocket: ${wsConnected ? '✅ aktif' : '❌ bağlı değil'} | RPC: ${rpcHost(RPCS[rpcIndex])}`,
       `⛓ Son taranan blok: ${stats.lastBlock || '-'}`,
       `🧾 Claim: ${stats.claims} | Gönderilen bildirim: ${stats.notified} | Kuyrukta: ${undelivered.length}`,
@@ -1398,6 +1517,17 @@ async function main() {
   bot.onText(/\/sc1/, (msg) => bot.sendMessage(msg.chat.id, buildTierMsg(1), { parse_mode: 'HTML' }).catch(console.error));
   bot.onText(/\/sc2/, (msg) => bot.sendMessage(msg.chat.id, buildTierMsg(2), { parse_mode: 'HTML' }).catch(console.error));
   bot.onText(/\/sc3/, (msg) => bot.sendMessage(msg.chat.id, buildTierMsg(3), { parse_mode: 'HTML' }).catch(console.error));
+
+  bot.onText(/\/kontrat/, async (msg) => {
+    const chatId = msg.chat.id;
+    await registerChat(chatId);
+    await bot.sendMessage(chatId, '🔎 Kontratlar okunuyor (30-60 sn sürebilir)...');
+    try {
+      for (const part of chunkText(await probeContracts())) await bot.sendMessage(chatId, part);
+    } catch (e) {
+      await bot.sendMessage(chatId, `❌ Kontrat keşfi hatası: ${e.message}`);
+    }
+  });
 
   bot.onText(/\/diag (.+)/, async (msg, match) => {
     const chatId = msg.chat.id;
