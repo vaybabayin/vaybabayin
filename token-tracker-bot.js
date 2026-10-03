@@ -1,11 +1,15 @@
 require('dotenv').config();
+const fs   = require('fs');
+const path = require('path');
 const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v11.6';
+const VERSION = 'v11.7';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const CHANNEL_ID    = process.env.TELEGRAM_CHANNEL_ID || null;
+// One or more chat IDs, comma-separated. Chats listed here survive redeploys
+// without anyone having to send /start again.
+const CHANNEL_IDS   = (process.env.TELEGRAM_CHANNEL_ID || '').split(',').map(s => s.trim()).filter(Boolean);
 const CONTRACT      = process.env.TOKEN_CONTRACT || '0xAe5F595803B2AA4D07aF8b392e535876a974a296';
 const SC1_TARGET    = parseInt(process.env.SC1_TARGET || '200');
 const SC2_TARGET    = parseInt(process.env.SC2_TARGET || '200');
@@ -24,8 +28,17 @@ const USDC_LOWER     = '0x833589fcd6edb6e08f4c7c32d4f71b54bda02913';
 const BOT_START_TS    = Math.floor(Date.now() / 1000);
 const LIVE_WINDOW_SEC = 300;
 
-const registeredChats = new Set();
-if (CHANNEL_ID) registeredChats.add(String(CHANNEL_ID));
+const registeredChats = new Set(CHANNEL_IDS);
+
+// Chats and the NFT→tier map used to live only in memory, so every Railway
+// redeploy wiped them: notifications were silently discarded until someone
+// sent /start again, and cards bought before the deploy lost their tier.
+// Both are persisted to disk — across restarts always, and across redeploys
+// when a Railway volume is mounted (RAILWAY_VOLUME_MOUNT_PATH / DATA_DIR).
+const DATA_DIR      = process.env.DATA_DIR || process.env.RAILWAY_VOLUME_MOUNT_PATH || __dirname;
+const STATE_FILE    = path.join(DATA_DIR, 'bot-state.json');
+const NFT_STATE_MAX = 20000;
+let savedStateSig   = '';
 
 const RPCS = [
   ALCHEMY_HTTP,
@@ -109,24 +122,82 @@ let ethPrice = 0, ethPriceAt = 0;
 let lastPollBlock = 0;
 let isLoadingHistory = false;
 let _recentTiersPromise = null;
-let _nftContractAddr = (process.env.NFT_CONTRACT || '').toLowerCase() || null;
+// Known scratch-card NFT contract, so the WebSocket subscription and the tier
+// warm-up scan work from the first second instead of waiting to auto-detect it.
+let _nftContractAddr = (process.env.NFT_CONTRACT || '0x154dacdec3459e551fc426f82e78e518a1f8f984').toLowerCase();
+let rpcIndex = 0;
+let primaryRetryTimer = null;
+
+// Notifications produced while no chat is registered are kept and delivered
+// to the first chat that registers instead of being thrown away.
+const undelivered     = [];
+const UNDELIVERED_MAX = 50;
+
+// Claims that hit a transient failure (receipt not indexed yet, price APIs
+// down, tier lookup failed) are retried instead of being dropped for good.
+const retryQueue = new Map(); // txHash → { tries, due }
+const RETRY_MAX  = 4;
+const inFlight   = new Set();
+
+const stats = { claims: 0, notified: 0, skipNoTier: 0, skipFree: 0, skipNoValue: 0, retries: 0, lastBlock: 0 };
 
 // WebSocket subscription state
 let wsProvider       = null;
 let wsConnected      = false;
 let wsReconnectTimer = null;
 
-async function getProvider() {
-  for (const rpc of RPCS) {
+const sleep   = (ms) => new Promise(r => setTimeout(r, ms));
+const rpcHost = (u) => { try { return new URL(u).host; } catch (_) { return '?'; } };
+
+// Tries RPCs starting at `startAt`, so a failing endpoint is rotated away from
+// instead of being picked again just because it is first in the list.
+async function getProvider(startAt = 0) {
+  for (let i = 0; i < RPCS.length; i++) {
+    const idx = (startAt + i) % RPCS.length;
     try {
-      const p = new ethers.JsonRpcProvider(rpc);
+      const p = new ethers.JsonRpcProvider(RPCS[idx]);
       await Promise.race([p.getBlockNumber(),
         new Promise((_, r) => setTimeout(() => r(new Error('timeout')), 5000))]);
-      console.log(`[RPC ✓] ${rpc}`);
+      console.log(`[RPC ✓] ${rpcHost(RPCS[idx])}`);
+      rpcIndex = idx;
       return p;
-    } catch (e) { console.log(`[RPC ✗] ${e.message.slice(0, 70)}`); }
+    } catch (e) { console.log(`[RPC ✗] ${rpcHost(RPCS[idx])} ${e.message.slice(0, 70)}`); }
   }
   throw new Error('Hiçbir RPC bağlanamadı');
+}
+
+async function switchProvider() {
+  try { provider = await getProvider(rpcIndex + 1); } catch (_) { return; }
+  // Fell back off the primary (Alchemy): try to return to it in 10 minutes.
+  if (rpcIndex !== 0 && !primaryRetryTimer) {
+    primaryRetryTimer = setTimeout(async () => {
+      primaryRetryTimer = null;
+      try { provider = await getProvider(0); } catch (_) {}
+    }, 10 * 60_000);
+  }
+}
+
+function loadState() {
+  try {
+    const s = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
+    for (const id of s.chats || []) registeredChats.add(String(id));
+    for (const [id, e] of s.nftToTier || []) if (!nftToTier.has(id)) nftToTier.set(id, e);
+    console.log(`[STATE] yüklendi: chat=${(s.chats || []).length} nft=${(s.nftToTier || []).length} (${STATE_FILE})`);
+  } catch (e) {
+    if (e.code !== 'ENOENT') console.error('[STATE] okunamadı:', e.message);
+  }
+  savedStateSig = `${registeredChats.size}:${nftToTier.size}`;
+}
+
+function saveState(force = false) {
+  const sig = `${registeredChats.size}:${nftToTier.size}`;
+  if (!force && sig === savedStateSig) return;
+  try {
+    const nft = [...nftToTier.entries()].slice(-NFT_STATE_MAX);
+    fs.writeFileSync(STATE_FILE + '.tmp', JSON.stringify({ chats: [...registeredChats], nftToTier: nft }));
+    fs.renameSync(STATE_FILE + '.tmp', STATE_FILE);
+    savedStateSig = sig;
+  } catch (e) { console.error('[STATE] yazılamadı:', e.message); }
 }
 
 async function getEthUsd() {
@@ -302,21 +373,54 @@ function overallAvg(tierNum) {
   return h.reduce((s, c) => s + c.usd, 0) / h.length;
 }
 
-async function sendNotification(msg) {
-  if (registeredChats.size === 0) {
-    console.log('[NOTIFY] kayıtlı chat yok — bildirim gönderilemiyor. /track ile ekleyin.');
-    return;
-  }
-  for (const chatId of registeredChats) {
+// Sends one message, retrying once on transient errors (network blips,
+// Telegram rate limits). Chats that blocked/removed the bot are unregistered.
+async function deliver(chatId, msg) {
+  for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       await bot.sendMessage(chatId, msg, { parse_mode: 'HTML', disable_web_page_preview: true });
+      return true;
     } catch (e) {
-      console.error(`[TG HATA] chat=${chatId} | ${e.message}`);
-      if (e.message?.includes('bot was blocked') || e.message?.includes('chat not found')) {
+      const m = e.message || '';
+      console.error(`[TG HATA] chat=${chatId} deneme=${attempt} | ${m}`);
+      if (m.includes('bot was blocked') || m.includes('chat not found') || m.includes('kicked')) {
         registeredChats.delete(chatId);
+        saveState(true);
+        return false;
       }
+      if (attempt === 1) await sleep(2000);
     }
   }
+  return false;
+}
+
+async function sendNotification(msg) {
+  if (registeredChats.size === 0) {
+    undelivered.push(msg);
+    if (undelivered.length > UNDELIVERED_MAX) undelivered.shift();
+    console.log(`[NOTIFY] kayıtlı chat yok — bildirim kuyruğa alındı (${undelivered.length}). /start gönderin veya TELEGRAM_CHANNEL_ID ayarlayın.`);
+    return;
+  }
+  let ok = false;
+  for (const chatId of [...registeredChats]) ok = (await deliver(chatId, msg)) || ok;
+  if (ok) stats.notified++;
+}
+
+// Registers a chat for notifications, persists it, and hands it any
+// notifications that were queued while no chat was registered.
+async function registerChat(chatId) {
+  const id = String(chatId);
+  if (registeredChats.has(id)) return false;
+  registeredChats.add(id);
+  saveState(true);
+  console.log(`[TG] Chat kaydedildi: ${id} (toplam: ${registeredChats.size})`);
+  if (undelivered.length) {
+    const queued = undelivered.splice(0);
+    await bot.sendMessage(id, `📦 Chat kayıtlı değilken gelen ${queued.length} bildirim:`).catch(() => {});
+    for (const msg of queued) await deliver(id, msg);
+    stats.notified += queued.length;
+  }
+  return true;
 }
 
 function rememberNftContract(receipt) {
@@ -499,70 +603,63 @@ function findUsdcPayment(receipt, payer) {
   return Number(total) / 1e6;
 }
 
-let _bsInstancesDisabled = false;
+// The mint tx of a card, looked up on the NFT contract's instance history.
+// (This used to query the coordinator address, which has no NFT instances,
+// so it always 404'd and then disabled itself for the rest of the run.)
 async function findMintTxBlockscout(nftId) {
-  if (_bsInstancesDisabled) return null;
+  if (!_nftContractAddr) return null;
   try {
-    const addr = CONTRACT.toLowerCase();
-    const url = `https://base.blockscout.com/api/v2/tokens/${addr}/instances/${nftId}/transfers`;
+    const url = `https://base.blockscout.com/api/v2/tokens/${_nftContractAddr}/instances/${nftId}/transfers`;
     const r = await axios.get(url, { timeout: 10000 });
-    const items = r.data?.items || [];
-    for (const t of items) {
+    for (const t of r.data?.items || []) {
       const fromHash = (t.from?.hash || t.from || '').toLowerCase();
       if (fromHash === ZERO_ADDRESS) return t.transaction_hash || t.tx_hash || t.hash || null;
     }
-  } catch (e) {
-    if (e.response?.status === 404 && !_bsInstancesDisabled) {
-      _bsInstancesDisabled = true;
-    }
-  }
+  } catch (_) {}
   return null;
 }
 
-// Alchemy is already the main provider — use it for logs too.
-function getLogsProvider() { return provider; }
-
-async function _scanLogsForMint(rpcLabel, lp, queryAddr, tokenIdHex, fromZeroTopic, latest, maxLookback, chunk, delayMs) {
-  let chunksTried = 0, chunksFailed = 0;
-  for (let offset = 0; offset < maxLookback; offset += chunk) {
-    const toBlock   = latest - offset;
-    const fromBlock = Math.max(0, toBlock - chunk + 1);
-    if (toBlock < fromBlock) break;
-    chunksTried++;
+// RPCs cap eth_getLogs block ranges differently (Alchemy's free tier allows
+// only 10 blocks). Ranges are queried in chunks; the chunk size is halved
+// whenever a range is refused and the working size is remembered, so history
+// scans succeed on any plan instead of failing silently.
+let logsSpan = 2000;
+async function getLogsChunked(filter, fromBlock, toBlock) {
+  const out = [];
+  let start = fromBlock;
+  while (start <= toBlock) {
+    const end = Math.min(toBlock, start + logsSpan - 1);
     try {
-      const logs = await lp.getLogs({
-        address: queryAddr,
-        topics: [TRANSFER_TOPIC, fromZeroTopic, null, tokenIdHex],
-        fromBlock, toBlock,
-      });
-      if (logs.length) return logs[0].transactionHash;
+      out.push(...await provider.getLogs({ ...filter, fromBlock: start, toBlock: end }));
+      start = end + 1;
     } catch (e) {
-      chunksFailed++;
+      if (logsSpan <= 10) throw e;
+      logsSpan = Math.max(10, Math.floor(logsSpan / 2));
     }
-    if (fromBlock === 0) break;
-    if (delayMs) await new Promise(r => setTimeout(r, delayMs));
   }
-  return null;
+  return out;
 }
 
 async function findMintTxOnchain(nftId) {
   if (!_nftContractAddr) return null;
-  const tokenIdHex    = '0x' + BigInt(nftId).toString(16).padStart(64, '0');
-  const fromZeroTopic = '0x' + '0'.repeat(64);
+  const topics = [TRANSFER_TOPIC, '0x' + '0'.repeat(64), null, '0x' + BigInt(nftId).toString(16).padStart(64, '0')];
   try {
     const latest = await provider.getBlockNumber();
-    // Try wide-range query first (Alchemy allows larger ranges)
-    try {
-      const logs = await provider.getLogs({
-        address: _nftContractAddr,
-        topics: [TRANSFER_TOPIC, fromZeroTopic, null, tokenIdHex],
-        fromBlock: Math.max(0, latest - 1_500_000),
-        toBlock: latest,
-      });
-      if (logs.length) return logs[0].transactionHash;
-    } catch (_) {}
-    // Fallback: chunked scan
-    return await _scanLogsForMint('mainRPC', provider, _nftContractAddr, tokenIdHex, fromZeroTopic, latest, 200_000, 9999, 250);
+    // Newest blocks first with a bounded request budget: the token-id filter
+    // keeps each response tiny, the budget keeps one unknown card from
+    // hammering the RPC when only small ranges are allowed.
+    let to = latest, budget = 200;
+    while (to > 0 && budget-- > 0 && latest - to < 1_500_000) {
+      const from = Math.max(0, to - logsSpan + 1);
+      try {
+        const logs = await provider.getLogs({ address: _nftContractAddr, topics, fromBlock: from, toBlock: to });
+        if (logs.length) return logs[0].transactionHash;
+        to = from - 1;
+      } catch (_) {
+        if (logsSpan <= 10) return null;
+        logsSpan = Math.max(10, Math.floor(logsSpan / 2));
+      }
+    }
   } catch (_) {}
   return null;
 }
@@ -576,7 +673,9 @@ async function findMintTxHash(nftId) {
 }
 
 async function recoverTierFromBuyTx(nftId) {
-  await ensureRecentTiers();
+  // The warm-up history scan may hold the answer, but don't let a slow scan
+  // block claim processing for minutes — fall through to a direct lookup.
+  if (_recentTiersPromise) await Promise.race([_recentTiersPromise, sleep(5000)]).catch(() => {});
   if (nftToTier.has(nftId)) return nftToTier.get(nftId).tier;
   try {
     const found = await findMintTxHash(nftId);
@@ -610,19 +709,11 @@ async function ensureRecentTiers() {
       const latest = await provider.getBlockNumber();
       const fromBlock = Math.max(0, latest - 9000);
       const fromZeroTopic = '0x' + '0'.repeat(64);
-      const allHashes = new Set();
-
-      const gatherLogs = async (params) => {
-        try {
-          const logs = await provider.getLogs(params);
-          for (const l of logs) allHashes.add(l.transactionHash);
-        } catch (_) {}
-      };
-
-      await Promise.all([
-        gatherLogs({ address: _nftContractAddr, topics: [TRANSFER_TOPIC, fromZeroTopic], fromBlock, toBlock: latest }),
-        gatherLogs({ address: CONTRACT_LOWER, fromBlock, toBlock: latest }),
-      ]);
+      // Every buy mints a card, so the NFT mint logs alone cover all buys.
+      const mintLogs = await getLogsChunked(
+        { address: _nftContractAddr, topics: [TRANSFER_TOPIC, fromZeroTopic] }, fromBlock, latest);
+      const allHashes = new Set(mintLogs.map(l => l.transactionHash));
+      console.log(`[TIER] geçmiş tarama: ${allHashes.size} buy tx (son 9000 blok)`);
 
       for (const hash of allHashes) {
         try {
@@ -754,18 +845,28 @@ async function calcTotalUsd(received, sources, capUsd = PER_TOKEN_MAX_USD) {
   return { totalUsd, tokenSummary, tokenDetail, droppedSummary };
 }
 
-async function processTx(txHash, from, data, blockNum, blockTs) {
-  if (processedTxs.has(txHash)) return;
+// Returns 'ok' | 'buy' | 'skip' | 'dup' | 'retry'. On 'retry' the tx is
+// released from processedTxs so the retry queue can run it again — a tx is
+// never marked done by a transient failure (that used to lose claims for good).
+async function processTx(txHash, from, data, blockNum, blockTs, receipt = null) {
+  if (processedTxs.has(txHash)) return 'dup';
   processedTxs.add(txHash);
   if (processedTxs.size > 20000) {
     const arr = [...processedTxs]; processedTxs = new Set(arr.slice(-10000));
   }
+  const retry = (why) => {
+    processedTxs.delete(txHash);
+    console.log(`[RETRY?] ${txHash.slice(0,10)} ${why}`);
+    return 'retry';
+  };
 
   const isRecentTx = blockTs >= BOT_START_TS - LIVE_WINDOW_SEC;
 
-  let receipt;
-  try { receipt = await provider.getTransactionReceipt(txHash); } catch (e) { return; }
-  if (!receipt || receipt.status === 0) return;
+  if (!receipt) {
+    try { receipt = await provider.getTransactionReceipt(txHash); } catch (e) { return retry('receipt hatası'); }
+  }
+  if (!receipt) return retry('receipt henüz yok');
+  if (receipt.status === 0) return 'skip';
 
   rememberNftContract(receipt);
 
@@ -784,7 +885,7 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
       // Unknown tier on a real mint signals a contract/format change — keep.
       console.log(`[BUY?] tier yok sel=${data?.slice(0,10)} ids=[${mintedIds.join(',')}] | ${txHash.slice(0,10)}`);
     }
-    return;
+    return 'buy';
   }
 
   // CLAIM TX
@@ -792,15 +893,21 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
   const claimer = burn ? burn.from.toLowerCase() : from.toLowerCase();
 
   const { received, sources } = collectReceived(receipt, claimer);
-  if (!Object.keys(received).length) return;
+  if (!Object.keys(received).length) return 'skip';
 
   let claimedNftId = burn?.nftId ?? nftIdFromCalldata(data);
+  const tag = `#${claimedNftId} ${txHash.slice(0,10)}`;
 
   let entry = claimedNftId ? nftToTier.get(claimedNftId) : null;
   let tier = entry?.tier ?? null;
 
-  const { totalUsd } = await calcTotalUsd(received, sources, perTokenCapUsd(tier));
-  if (totalUsd <= 0) return;
+  const { totalUsd, droppedSummary } = await calcTotalUsd(received, sources, perTokenCapUsd(tier));
+  if (totalUsd <= 0) {
+    if (droppedSummary.some(d => d.includes('NO_PRICE'))) return retry(`fiyat alınamadı ${tag}`);
+    stats.skipNoValue++;
+    console.log(`[SKIP] değer 0 ${tag} ${droppedSummary.join(' ')}`);
+    return 'skip';
+  }
 
   if (tier === null && claimedNftId && (!isLoadingHistory || isRecentTx)) {
     tier = await recoverTierFromBuyTx(claimedNftId);
@@ -808,9 +915,17 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
   }
 
   // Skip free packages — only notify for cards bought with ~1 USDC.
-  if (entry && typeof entry.paid === 'number' && entry.paid < MIN_PAID_USDC) return;
+  if (entry && typeof entry.paid === 'number' && entry.paid < MIN_PAID_USDC) {
+    stats.skipFree++;
+    console.log(`[SKIP] ücretsiz paket (paid=$${entry.paid}) ${tag}`);
+    return 'skip';
+  }
 
-  if (tier === null) return;
+  if (tier === null) {
+    stats.skipNoTier++;
+    return retry(`tier bulunamadı ${tag} $${totalUsd.toFixed(2)}`);
+  }
+  stats.claims++;
 
   const tierInfo  = TIER_INFO[tier];
   const cycleSize = getCycleSize(tier);
@@ -829,7 +944,7 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
   state.history.unshift({ usd: totalUsd, ts: blockTs * 1000, hash: txHash, claimer: from });
   if (state.history.length > Math.max(cycleSize, 200)) state.history.pop();
 
-  if (isLoadingHistory && !isRecentTx) return;
+  if (isLoadingHistory && !isRecentTx) return 'ok';
 
   const pos        = state.sessionCount > 0 ? state.sessionCount : state.count;
   const posInCycle = ((pos - 1) % cycleSize) + 1;
@@ -864,6 +979,49 @@ async function processTx(txHash, from, data, blockNum, blockTs) {
 
   console.log(`[✓] ${tierInfo.name} $${totalUsd.toFixed(2)} ${posInCycle}/${cycleSize} #${claimedNftId}`);
   await sendNotification(msg);
+  return 'ok';
+}
+
+// Fetches a tx and processes it; anything that fails transiently goes to the
+// retry queue. Returns true once the tx is fully handled.
+async function handleTxHash(hash) {
+  if (inFlight.has(hash)) return true;
+  inFlight.add(hash);
+  try {
+    const bundle = await fetchTxBundle(hash);
+    if (!bundle) { scheduleRetry(hash, 'tx alınamadı'); return false; }
+    const status = await processTx(hash, bundle.tx.from, bundle.tx.data || '',
+      bundle.receipt.blockNumber, bundle.block?.timestamp || 0, bundle.receipt);
+    if (status === 'retry') { scheduleRetry(hash, 'işlenemedi'); return false; }
+    retryQueue.delete(hash);
+    return true;
+  } catch (e) {
+    console.error(`[TX] ${hash.slice(0,10)}: ${e.message?.slice(0,80)}`);
+    scheduleRetry(hash, 'hata');
+    return false;
+  } finally {
+    inFlight.delete(hash);
+  }
+}
+
+function scheduleRetry(hash, why) {
+  const r = retryQueue.get(hash) || { tries: 0 };
+  r.tries++;
+  if (r.tries > RETRY_MAX) {
+    retryQueue.delete(hash);
+    console.log(`[RETRY] vazgeçildi ${hash.slice(0,10)} (${why}, ${RETRY_MAX} deneme)`);
+    return;
+  }
+  r.due = Date.now() + 15_000 * r.tries;
+  retryQueue.set(hash, r);
+  stats.retries++;
+}
+
+async function processDueRetries() {
+  const now = Date.now();
+  for (const [hash, r] of [...retryQueue]) {
+    if (r.due <= now) await handleTxHash(hash);
+  }
 }
 
 async function diagnoseTx(txHash) {
@@ -956,20 +1114,18 @@ async function diagnoseTx(txHash) {
   return lines.join('\n');
 }
 
-async function scanMintLogs(from, to) {
-  if (!_nftContractAddr) return [];
-  const fromZeroTopic = '0x' + '0'.repeat(64);
-  try {
-    const logs = await provider.getLogs({ address: _nftContractAddr, topics: [TRANSFER_TOPIC, fromZeroTopic], fromBlock: from, toBlock: to });
-    return [...new Set(logs.map(l => l.transactionHash))];
-  } catch (_) { return []; }
-}
-
-async function scanCoordinatorLogs(from, to) {
-  try {
-    const logs = await provider.getLogs({ address: CONTRACT_LOWER, fromBlock: from, toBlock: to });
-    return [...new Set(logs.map(l => l.transactionHash))];
-  } catch (_) { return []; }
+// Tx hashes touching the coordinator or minting a card in [from, to], in chain
+// order (so a buy is registered before a claim of the same card). Throws on
+// RPC errors on purpose: the caller then retries the same range instead of
+// skipping it — returning [] here used to silently drop whole block ranges.
+async function scanRangeTxs(from, to) {
+  const queries = [provider.getLogs({ address: CONTRACT_LOWER, fromBlock: from, toBlock: to })];
+  if (_nftContractAddr) queries.push(provider.getLogs({
+    address: _nftContractAddr, topics: [TRANSFER_TOPIC, '0x' + '0'.repeat(64)], fromBlock: from, toBlock: to,
+  }));
+  const logs = (await Promise.all(queries)).flat()
+    .sort((a, b) => a.blockNumber - b.blockNumber || (a.index ?? 0) - (b.index ?? 0));
+  return [...new Set(logs.map(l => l.transactionHash))];
 }
 
 async function fetchTxBundle(hash) {
@@ -993,14 +1149,8 @@ async function fetchTxBundle(hash) {
 // WebSocket real-time event handler
 async function handleLiveLog(log) {
   const txHash = log.transactionHash;
-  if (!txHash || processedTxs.has(txHash)) return;
-  try {
-    const bundle = await fetchTxBundle(txHash);
-    if (!bundle) return;
-    await processTx(txHash, bundle.tx.from, bundle.tx.data || '', bundle.receipt.blockNumber, bundle.block?.timestamp || 0);
-  } catch (e) {
-    console.error(`[WS] ${txHash.slice(0,10)}: ${e.message?.slice(0,80)}`);
-  }
+  if (!txHash || processedTxs.has(txHash) || retryQueue.has(txHash)) return;
+  await handleTxHash(txHash);
 }
 
 async function startWsSubscription() {
@@ -1048,51 +1198,44 @@ async function startWsSubscription() {
   }
 }
 
+// Alchemy's free tier refuses eth_getLogs ranges over 10 blocks, and a
+// refused range used to be skipped silently — keep each poll inside the limit.
+const POLL_SPAN = 10;
+
+// One poll step. Returns true when caught up with the chain head.
+async function pollOnce() {
+  await processDueRetries();
+  const cur = await provider.getBlockNumber();
+  if (lastPollBlock === 0) lastPollBlock = cur - 1;
+  if (cur <= lastPollBlock) return true;
+  const from = lastPollBlock + 1;
+  const to   = Math.min(cur, lastPollBlock + POLL_SPAN);
+  for (const hash of await scanRangeTxs(from, to)) {
+    if (processedTxs.has(hash) || retryQueue.has(hash)) continue;
+    await handleTxHash(hash);
+  }
+  // Only advance once the range was read successfully; failed txs inside it
+  // are already in the retry queue.
+  lastPollBlock = to;
+  stats.lastBlock = to;
+  return to >= cur;
+}
+
 async function pollLoop() {
   let fails = 0;
   console.log('[POLL] Canlı izleme başlıyor...');
   while (true) {
     try {
-      const cur = await provider.getBlockNumber();
-      if (lastPollBlock === 0) lastPollBlock = cur - 1;
-      if (cur > lastPollBlock) {
-        const from = lastPollBlock + 1;
-        const to   = Math.min(cur, lastPollBlock + 20);
-
-        const coordTxs = await scanCoordinatorLogs(from, to);
-        for (const hash of coordTxs) {
-          if (processedTxs.has(hash)) continue;
-          const bundle = await fetchTxBundle(hash);
-          if (!bundle) { console.log(`[POLL miss] ${hash.slice(0,10)} fetch failed`); continue; }
-          try {
-            await processTx(hash, bundle.tx.from, bundle.tx.data || '', bundle.receipt.blockNumber, bundle.block?.timestamp || 0);
-          } catch (e) {
-            console.error(`[POLL processTx] ${hash.slice(0,10)}: ${e.message?.slice(0,80)}`);
-          }
-        }
-
-        const mintTxs = await scanMintLogs(from, to);
-        for (const hash of mintTxs) {
-          if (processedTxs.has(hash)) continue;
-          const bundle = await fetchTxBundle(hash);
-          if (!bundle) { console.log(`[POLL miss] ${hash.slice(0,10)} (mint) fetch failed`); continue; }
-          try {
-            await processTx(hash, bundle.tx.from, bundle.tx.data || '', bundle.receipt.blockNumber, bundle.block?.timestamp || 0);
-          } catch (e) {
-            console.error(`[POLL processTx mint] ${hash.slice(0,10)}: ${e.message?.slice(0,80)}`);
-          }
-        }
-
-        lastPollBlock = to;
-      }
+      const caughtUp = await pollOnce();
       fails = 0;
-      // When WS is live it handles real-time events; poll is just gap-filler backup.
-      await new Promise(r => setTimeout(r, wsConnected ? 6000 : 2500));
+      // When WS is live it handles real-time events; poll is the gap-filler.
+      // While behind the chain head, keep going without sleeping.
+      if (caughtUp) await sleep(wsConnected ? 6000 : 2500);
     } catch (e) {
       fails++;
-      console.error('[POLL]', e.message.slice(0, 80));
-      if (fails >= 5) { try { provider = await getProvider(); fails = 0; } catch (_) {} }
-      await new Promise(r => setTimeout(r, Math.min(fails * 3000, 30000)));
+      console.error(`[POLL] hata #${fails} (blok ${lastPollBlock + 1}):`, (e.message || '').slice(0, 100));
+      if (fails >= 3) { await switchProvider(); fails = 0; }
+      await sleep(Math.min((fails + 1) * 3000, 30000));
     }
   }
 }
@@ -1124,15 +1267,20 @@ function buildTierMsg(tierNum) {
 
 const TIERS_ORDER = [1, 2, 3];
 
+// Reminder shown on /start and /test until the chat is pinned via env var.
+function channelIdHint(chatId) {
+  if (CHANNEL_IDS.includes(String(chatId))) return null;
+  return `📌 Redeploy sonrası bildirimler kesilmesin diye Railway → Variables'a ekle:\n<code>TELEGRAM_CHANNEL_ID=${chatId}</code>`;
+}
+
 async function startConversation(chatId) {
-  const isNew = !registeredChats.has(String(chatId));
-  registeredChats.add(String(chatId));
-  if (isNew) console.log(`[TG] Yeni chat: ${chatId} (toplam: ${registeredChats.size})`);
+  await registerChat(chatId);
 
   const lines = [
     `👋 <b>Scratch Card Tracker</b> ${VERSION}`,
     '',
     '✅ Bu chat bildirim listesine eklendi.',
+    channelIdHint(chatId),
     '',
     '📊 Döngü Sayıcıları:',
     `  • 🔵 mavi: Kaç tane açıldı? (?/${SC1_TARGET})`,
@@ -1140,7 +1288,7 @@ async function startConversation(chatId) {
     `  • 🟣 mor: Seri kaç paketlik? + Kaç tane açıldı?`,
     '',
     '💬 Sırayla cevapla',
-  ];
+  ].filter(l => l !== null);
   await bot.sendMessage(chatId, lines.join('\n'), { parse_mode: 'HTML' });
   conversations[chatId] = { step: 'tier1', data: {} };
   await bot.sendMessage(chatId, `🔵 mavi: Kaç tane açıldı? (?/${SC1_TARGET})`);
@@ -1189,24 +1337,30 @@ async function handleConversationReply(chatId, text) {
 }
 
 async function main() {
+  loadState();
   provider = await getProvider();
   bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+
+  // Persist state periodically and on shutdown (Railway sends SIGTERM on redeploy).
+  setInterval(() => saveState(), 15_000);
+  for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => { saveState(true); process.exit(0); });
 
   bot.onText(/\/start/, (msg) => startConversation(msg.chat.id).catch(console.error));
 
   bot.onText(/\/track/, async (msg) => {
-    registeredChats.add(String(msg.chat.id));
-    console.log(`[TG] Chat kaydedildi: ${msg.chat.id}`);
-    await bot.sendMessage(msg.chat.id, '✅ Bu chat bildirim listesine eklendi.');
+    await registerChat(msg.chat.id);
+    const hint = channelIdHint(msg.chat.id);
+    await bot.sendMessage(msg.chat.id, '✅ Bu chat bildirim listesine eklendi.' + (hint ? '\n' + hint : ''), { parse_mode: 'HTML' });
   });
 
   bot.onText(/\/stop/, async (msg) => {
     registeredChats.delete(String(msg.chat.id));
+    saveState(true);
     await bot.sendMessage(msg.chat.id, '🔕 Bildirim listesinden çıkarıldı.');
   });
 
   bot.onText(/\/komut/, async (msg) => {
-    registeredChats.add(String(msg.chat.id));
+    await registerChat(msg.chat.id);
     const lines = [
       `📋 <b>Komut Listesi</b> ${VERSION}`,
       '',
@@ -1224,16 +1378,20 @@ async function main() {
   });
 
   bot.onText(/\/test/, async (msg) => {
-    registeredChats.add(String(msg.chat.id));
+    await registerChat(msg.chat.id);
     const lines = [
       `✅ <b>Test</b> ${VERSION}`,
-      `📡 Kayıtlı chat: ${registeredChats.size}`,
+      `📡 Kayıtlı chat: ${registeredChats.size} (bu chat: <code>${msg.chat.id}</code>)`,
       `📇 NFT map: ${nftToTier.size}`,
-      `🔌 WebSocket: ${wsConnected ? '✅ aktif' : '❌ bağlı değil'}`,
+      `🔌 WebSocket: ${wsConnected ? '✅ aktif' : '❌ bağlı değil'} | RPC: ${rpcHost(RPCS[rpcIndex])}`,
+      `⛓ Son taranan blok: ${stats.lastBlock || '-'}`,
+      `🧾 Claim: ${stats.claims} | Gönderilen bildirim: ${stats.notified} | Kuyrukta: ${undelivered.length}`,
+      `⏭ Atlanan — ücretsiz: ${stats.skipFree}, değer 0: ${stats.skipNoValue}, tier yok: ${stats.skipNoTier} | Retry kuyruğu: ${retryQueue.size}`,
       `🔵 mavi (${SC1_TARGET}): ${ts(1).sessionCount}`,
       `🟢 yeşil (${SC2_TARGET}): ${ts(2).sessionCount}`,
       `🟣 mor (${sc3CycleOverride}): ${ts(3).sessionCount}`,
-    ];
+      channelIdHint(msg.chat.id),
+    ].filter(l => l !== null);
     await bot.sendMessage(msg.chat.id, lines.join('\n'), { parse_mode: 'HTML' });
   });
 
@@ -1243,7 +1401,7 @@ async function main() {
 
   bot.onText(/\/diag (.+)/, async (msg, match) => {
     const chatId = msg.chat.id;
-    registeredChats.add(String(chatId));
+    await registerChat(chatId);
     const txHash = match[1].trim();
     await bot.sendMessage(chatId, `🔍 Analiz ediliyor...`);
     const report = await diagnoseTx(txHash);
@@ -1260,23 +1418,27 @@ async function main() {
   bot.on('polling_error', (e) => {
     if (e.message?.includes('409')) {
       pollingErrCount++;
-      console.error(`[TG] 409 Conflict #${pollingErrCount} — başka bir instance aktif! Railway'de eski deployment durdur.`);
-      // Exit after 5 repeated 409s so Railway restarts cleanly
-      if (pollingErrCount >= 5) {
-        console.error('[TG] 409 limit aşıldı — process sonlandırılıyor.');
-        process.exit(1);
-      }
+      // Another getUpdates consumer holds this token (an overlapping Railway
+      // deploy, or someone using a leaked token). That only blocks incoming
+      // commands — sendMessage keeps working — so never exit here: exiting
+      // crash-looped the service into Railway's restart limit and stopped
+      // every notification along with it.
+      if (pollingErrCount === 1 || pollingErrCount % 50 === 0)
+        console.error(`[TG] 409 Conflict ×${pollingErrCount} — aynı token ile başka bir instance çalışıyor. Bildirimler etkilenmez; komutlar için eski deploy'u durdurun veya token'ı BotFather'dan yenileyin.`);
     } else {
       pollingErrCount = 0;
       console.error('[TG polling]', e.message);
     }
   });
 
-  console.log(`[${VERSION}] başladı | mavi=${SC1_TARGET} yeşil=${SC2_TARGET} mor=${sc3CycleOverride} | chat=${registeredChats.size} | Alchemy+WS`);
-  if (registeredChats.size === 0) console.log(`[UYARI] Kayıtlı chat yok — /track veya /test gönderin.`);
+  console.log(`[${VERSION}] başladı | mavi=${SC1_TARGET} yeşil=${SC2_TARGET} mor=${sc3CycleOverride} | chat=${registeredChats.size} | state=${STATE_FILE}`);
+  if (registeredChats.size === 0)
+    console.log(`[UYARI] Kayıtlı chat yok — bildirimler kuyruğa alınacak. /start gönderin ve TELEGRAM_CHANNEL_ID ayarlayın.`);
 
   // Start WebSocket subscription for real-time events (poll loop is backup)
   startWsSubscription().catch(() => {});
+  // Warm the NFT→tier map from recent buys in the background.
+  ensureRecentTiers().catch(() => {});
 
   lastPollBlock = 0;
   await pollLoop();
