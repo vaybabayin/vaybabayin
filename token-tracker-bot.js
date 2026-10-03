@@ -5,7 +5,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const { ethers } = require('ethers');
 const axios = require('axios');
 
-const VERSION = 'v11.8';
+const VERSION = 'v11.9';
 const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 // One or more chat IDs, comma-separated. Chats listed here survive redeploys
 // without anyone having to send /start again.
@@ -75,9 +75,122 @@ function perTokenCapUsd(tier) {
   return t ? t.jackpotMax : 30; // mavi $8 · yeşil $15 · mor $30 · unknown $30
 }
 
-// Runtime-mutable cycle size for mor (tier 3). Overridden via /start.
-let sc3CycleOverride = SC3_TARGET;
-function getCycleSize(tier) { return tier === 3 ? sc3CycleOverride : TIER_INFO[tier].target; }
+// ── Series (batch) tracking, read from chain ──────────────────────────────
+// The NFT contract stores every card's series: cards(id) → (batchId, tier,
+// mintedAt, outcome). Cards of a tier are sold series by series, so counting
+// minted cards per (tier, batchId) gives how many of the current series are
+// sold, and the total of the last finished series gives the series size —
+// no manual input needed. SC*_TARGET are only used until a size is learned.
+const NFT_ABI = [
+  'function cards(uint256) view returns (uint64 batchId, uint8 tier, uint64 mintedAt, bytes outcome)',
+];
+function newSeries() {
+  return { current: null, sold: new Map(), complete: new Set(), size: null, jackpots: new Map() };
+}
+const series = { 1: newSeries(), 2: newSeries(), 3: newSeries() };
+const countedMints = new Set();
+const seriesScan = { status: 'başlamadı', done: false };
+let stateRev = 0; // bumped on series changes that must be persisted
+
+// A card's tier and series. Pass the block before a burn to read a card that
+// has since been claimed (claimed cards read as empty at the latest block).
+async function readCard(nftId, blockTag) {
+  if (!_nftContractAddr) return null;
+  const c = new ethers.Contract(_nftContractAddr, NFT_ABI, provider);
+  for (const tag of blockTag !== undefined ? [blockTag, 'latest'] : ['latest']) {
+    try {
+      const r = await c.cards(BigInt(nftId), { blockTag: tag });
+      const tier = Number(r.tier), batchId = Number(r.batchId);
+      if (tier >= 1 && tier <= 3 && r.mintedAt > 0n) return { tier, batchId };
+    } catch (_) {}
+  }
+  return null;
+}
+
+// Counts one minted card. `live` mints extend the chain head; history-scan
+// mints arrive newest-first and never move the current series forward.
+function addSold(tier, batchId, nftId, live) {
+  if (countedMints.has(nftId)) return;
+  countedMints.add(nftId);
+  const s = series[tier];
+  s.sold.set(batchId, (s.sold.get(batchId) || 0) + 1);
+  if (s.current === null || batchId > s.current) {
+    // A new series started: the one it replaces is finished, and if it was
+    // counted from its first card its total is the series size.
+    if (live && s.current !== null && s.complete.has(s.current)) s.size = s.sold.get(s.current);
+    if (live && s.current !== null) s.complete.add(batchId);
+    s.current = batchId;
+  }
+}
+
+// Scans mints newest → oldest until, for every tier, the scan has passed
+// the start of the previous series (3 distinct series seen). Then the current
+// series is fully counted and the previous one gives the series size.
+async function scanSeriesHistory() {
+  if (!_nftContractAddr) return;
+  seriesScan.status = 'taranıyor';
+  const MAX_LOOKBACK = 600_000; // ~2 weeks of Base blocks
+  const fromZero = '0x' + '0'.repeat(64);
+  const seen = { 1: new Set(), 2: new Set(), 3: new Set() };
+  const done = () => [1, 2, 3].every(t => seen[t].size >= 3);
+  const head = await provider.getBlockNumber();
+  let to = head, cards = 0, failures = 0;
+  while (to > 0 && head - to < MAX_LOOKBACK && !done()) {
+    const from = Math.max(0, to - logsSpan + 1);
+    let logs;
+    try {
+      logs = await provider.getLogs({ address: _nftContractAddr, topics: [TRANSFER_TOPIC, fromZero], fromBlock: from, toBlock: to });
+      failures = 0;
+    } catch (e) {
+      if (logsSpan > 10) { logsSpan = Math.max(10, Math.floor(logsSpan / 2)); continue; }
+      if (++failures >= 20) throw new Error(`getLogs art arda başarısız: ${e.message}`);
+      await sleep(2000);
+      continue;
+    }
+    logs.sort((a, b) => b.blockNumber - a.blockNumber || (b.index ?? 0) - (a.index ?? 0));
+    for (const l of logs) {
+      if (l.topics.length !== 4) continue;
+      const id = BigInt(l.topics[3]).toString();
+      if (countedMints.has(id)) continue;
+      const card = await readCard(id, l.blockNumber);
+      if (!card) continue;
+      addSold(card.tier, card.batchId, id, false);
+      seen[card.tier].add(card.batchId);
+      cards++;
+    }
+    to = from - 1;
+    seriesScan.status = `taranıyor (${cards} kart, ${head - to} blok geri)`;
+  }
+  for (const t of [1, 2, 3]) {
+    const s = series[t];
+    const ids = [...seen[t]].sort((a, b) => b - a);
+    // Every series newer than the oldest one seen was counted from its start.
+    for (const b of ids.slice(0, -1)) s.complete.add(b);
+    if (ids.length >= 3) s.size = s.sold.get(ids[1]);
+  }
+  seriesScan.done = true;
+  seriesScan.status = `bitti (${cards} kart)`;
+  console.log(`[SERİ] ${[1, 2, 3].map(t => `${TIER_INFO[t].name}: ${seriesLine(t)}`).join(' | ')}`);
+}
+
+// "153/200 satıldı · 47 kaldı" for the tier's current series.
+function seriesStatus(tier) {
+  const s = series[tier];
+  if (s.current === null) return null;
+  const sold    = s.sold.get(s.current) || 0;
+  const exact   = s.complete.has(s.current);
+  const size    = s.size ?? TIER_INFO[tier].target;
+  const left    = Math.max(0, size - sold);
+  return { batchId: s.current, sold, size, left, exact, sizeKnown: s.size !== null };
+}
+
+function seriesLine(tier) {
+  const st = seriesStatus(tier);
+  if (!st) return seriesScan.done ? 'seri bilinmiyor' : 'seri sayılıyor…';
+  const soldTxt = st.exact ? `${st.sold}` : `≥${st.sold}`;
+  const sizeTxt = st.sizeKnown ? `${st.size}` : `${st.size}?`;
+  return `seri #${st.batchId}: ${soldTxt}/${sizeTxt} satıldı · ${st.exact ? '' : '≤'}${st.left} kaldı`;
+}
 
 const TRANSFER_TOPIC     = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 // Coordinator event sig prefixes (first 8 bytes of topic[0])
@@ -107,12 +220,11 @@ const WETH_LOWER       = WETH.toLowerCase();
 const tierStates = {};
 function ts(tier) {
   if (!tierStates[tier])
-    tierStates[tier] = { history: [], count: 0, sessionCount: 0, streak: 0, streakDir: null, jackpotCycleCount: 0 };
+    tierStates[tier] = { history: [], count: 0, streak: 0, streakDir: null };
   return tierStates[tier];
 }
 
 const nftToTier = new Map();
-const conversations = {};
 let processedTxs = new Set();
 let pollingErrCount = 0;
 let provider, bot;
@@ -182,19 +294,22 @@ function loadState() {
     const s = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
     for (const id of s.chats || []) registeredChats.add(String(id));
     for (const [id, e] of s.nftToTier || []) if (!nftToTier.has(id)) nftToTier.set(id, e);
+    // Jackpots seen per series (claim values can't be re-derived from chain).
+    for (const t of [1, 2, 3]) for (const [b, n] of s.jackpots?.[t] || []) series[t].jackpots.set(b, n);
     console.log(`[STATE] yüklendi: chat=${(s.chats || []).length} nft=${(s.nftToTier || []).length} (${STATE_FILE})`);
   } catch (e) {
     if (e.code !== 'ENOENT') console.error('[STATE] okunamadı:', e.message);
   }
-  savedStateSig = `${registeredChats.size}:${nftToTier.size}`;
+  savedStateSig = `${registeredChats.size}:${nftToTier.size}:${stateRev}`;
 }
 
 function saveState(force = false) {
-  const sig = `${registeredChats.size}:${nftToTier.size}`;
+  const sig = `${registeredChats.size}:${nftToTier.size}:${stateRev}`;
   if (!force && sig === savedStateSig) return;
   try {
     const nft = [...nftToTier.entries()].slice(-NFT_STATE_MAX);
-    fs.writeFileSync(STATE_FILE + '.tmp', JSON.stringify({ chats: [...registeredChats], nftToTier: nft }));
+    const jackpots = Object.fromEntries([1, 2, 3].map(t => [t, [...series[t].jackpots.entries()].slice(-20)]));
+    fs.writeFileSync(STATE_FILE + '.tmp', JSON.stringify({ chats: [...registeredChats], nftToTier: nft, jackpots }));
     fs.renameSync(STATE_FILE + '.tmp', STATE_FILE);
     savedStateSig = sig;
   } catch (e) { console.error('[STATE] yazılamadı:', e.message); }
@@ -725,7 +840,6 @@ async function ensureRecentTiers() {
   if (!_nftContractAddr) return;
   _recentTiersPromise = (async () => {
     try {
-      tierScanStatus = 'log taranıyor';
       const latest = await provider.getBlockNumber();
       const fromBlock = Math.max(0, latest - 9000);
       const fromZeroTopic = '0x' + '0'.repeat(64);
@@ -734,7 +848,6 @@ async function ensureRecentTiers() {
         { address: _nftContractAddr, topics: [TRANSFER_TOPIC, fromZeroTopic] }, fromBlock, latest);
       const allHashes = new Set(mintLogs.map(l => l.transactionHash));
       console.log(`[TIER] geçmiş tarama: ${allHashes.size} buy tx (son 9000 blok)`);
-      tierScanStatus = `${allHashes.size} buy işleniyor`;
 
       for (const hash of allHashes) {
         try {
@@ -756,9 +869,7 @@ async function ensureRecentTiers() {
           }
         } catch (_) {}
       }
-      tierScanStatus = `bitti (${allHashes.size} buy)`;
     } catch (e) {
-      tierScanStatus = `hata: ${(e.message || '').slice(0, 60)}`;
       console.error('[TIER] geçmiş tarama hatası:', e.message);
       _recentTiersPromise = null;
       throw e;
@@ -767,8 +878,6 @@ async function ensureRecentTiers() {
   try { await _recentTiersPromise; } catch (_) {}
   return _recentTiersPromise;
 }
-
-let tierScanStatus = 'başlamadı';
 
 // ── /kontrat: contract discovery ─────────────────────────────────────────
 // Reads the verified ABI of the coordinator (and its implementation if it is
@@ -992,13 +1101,20 @@ async function processTx(txHash, from, data, blockNum, blockTs, receipt = null) 
   const allMints = findAllNftMints(receipt);
   if (allMints.length) {
     const mintedIds = allMints.map(m => m.nftId);
-    const tier = tierFromCalldata(data) ?? findBuyTierFromLogs(receipt, mintedIds);
-    if (tier) {
-      const paid = findUsdcPayment(receipt, allMints[0].to);
-      for (const m of allMints) {
-        nftToTier.set(m.nftId, { tier, buyer: m.to, buyTxHash: txHash, buyTs: blockTs, paid });
-      }
-    } else if (!isLoadingHistory || isRecentTx) {
+    const paid = findUsdcPayment(receipt, allMints[0].to);
+    let fallbackTier;
+    let anyTier = false;
+    for (const m of allMints) {
+      // The NFT contract is the source of truth for tier and series; calldata
+      // and event parsing remain as a fallback if the read fails.
+      const card = await readCard(m.nftId, receipt.blockNumber);
+      if (card) addSold(card.tier, card.batchId, m.nftId, true);
+      const tier = card?.tier ?? (fallbackTier ??= tierFromCalldata(data) ?? findBuyTierFromLogs(receipt, mintedIds));
+      if (!tier) continue;
+      anyTier = true;
+      nftToTier.set(m.nftId, { tier, batchId: card?.batchId ?? null, buyer: m.to, buyTxHash: txHash, buyTs: blockTs, paid });
+    }
+    if (!anyTier && (!isLoadingHistory || isRecentTx)) {
       // Unknown tier on a real mint signals a contract/format change — keep.
       console.log(`[BUY?] tier yok sel=${data?.slice(0,10)} ids=[${mintedIds.join(',')}] | ${txHash.slice(0,10)}`);
     }
@@ -1016,7 +1132,10 @@ async function processTx(txHash, from, data, blockNum, blockTs, receipt = null) 
   const tag = `#${claimedNftId} ${txHash.slice(0,10)}`;
 
   let entry = claimedNftId ? nftToTier.get(claimedNftId) : null;
-  let tier = entry?.tier ?? null;
+  // Read the card as it was just before this claim burned it.
+  const card = claimedNftId ? await readCard(claimedNftId, receipt.blockNumber - 1) : null;
+  let tier = card?.tier ?? entry?.tier ?? null;
+  let batchId = card?.batchId ?? entry?.batchId ?? null;
 
   const { totalUsd, droppedSummary } = await calcTotalUsd(received, sources, perTokenCapUsd(tier));
   if (totalUsd <= 0) {
@@ -1044,9 +1163,10 @@ async function processTx(txHash, from, data, blockNum, blockTs, receipt = null) 
   }
   stats.claims++;
 
-  const tierInfo  = TIER_INFO[tier];
-  const cycleSize = getCycleSize(tier);
+  const tierInfo = TIER_INFO[tier];
   const state = ts(tier);
+  const s = series[tier];
+  if (batchId === null) batchId = s.current; // unknown series → assume current
 
   if (state.history.length > 0) {
     const dir = totalUsd >= state.history[0].usd ? 'up' : 'down';
@@ -1057,44 +1177,43 @@ async function processTx(txHash, from, data, blockNum, blockTs, receipt = null) 
   }
 
   state.count++;
-  if (!isLoadingHistory || isRecentTx) state.sessionCount++;
-  state.history.unshift({ usd: totalUsd, ts: blockTs * 1000, hash: txHash, claimer: from });
-  if (state.history.length > Math.max(cycleSize, 200)) state.history.pop();
+  state.history.unshift({ usd: totalUsd, ts: blockTs * 1000, hash: txHash, claimer: from, batchId });
+  if (state.history.length > 300) state.history.pop();
+
+  // Jackpot: Total Value inside the tier's band (mavi $4–8 · yeşil $7–15 ·
+  // mor $15–30), counted per series of the claimed card.
+  const { jackpotMin, jackpotMax, jackpotTotal } = tierInfo;
+  const isJackpot = totalUsd >= jackpotMin && totalUsd <= jackpotMax;
+  if (isJackpot && batchId !== null) {
+    s.jackpots.set(batchId, (s.jackpots.get(batchId) || 0) + 1);
+    stateRev++;
+  }
 
   if (isLoadingHistory && !isRecentTx) return 'ok';
 
-  const pos        = state.sessionCount > 0 ? state.sessionCount : state.count;
-  const posInCycle = ((pos - 1) % cycleSize) + 1;
-  const remaining  = cycleSize - posInCycle;
-  const date       = new Date(blockTs * 1000).toISOString().replace('T', ' ').slice(0, 19) + 'Z';
-  const txUrl      = `https://basescan.org/tx/${txHash}`;
-  const cycleSlice = state.history.slice(0, posInCycle);
-  const cycleAvg   = cycleSlice.reduce((s, c) => s + c.usd, 0) / (cycleSlice.length || 1);
+  const date = new Date(blockTs * 1000).toISOString().replace('T', ' ').slice(0, 19) + 'Z';
+  const txUrl = `https://basescan.org/tx/${txHash}`;
+  const inSeries = state.history.filter(h => h.batchId === batchId);
+  const seriesAvg = inSeries.reduce((a, h) => a + h.usd, 0) / (inSeries.length || 1);
+  const jackpotsHere = batchId !== null ? (s.jackpots.get(batchId) || 0) : 0;
 
-  // Jackpot detection: totalUsd within the tier's fixed band (v11.5).
-  //   mavi $4–8 · yeşil $7–15 · mor $15–30 (inclusive).
-  // Reset per-cycle counter when a new cycle begins (posInCycle wraps to 1).
-  const { jackpotMin, jackpotMax, jackpotTotal } = tierInfo;
-  const isJackpot = totalUsd >= jackpotMin && totalUsd <= jackpotMax;
-  if (posInCycle === 1 && pos > 1) state.jackpotCycleCount = 0; // new cycle
-  if (isJackpot) state.jackpotCycleCount++;
-
-  // Avg for this tier only
   const avgLine = [5, 10, 15, 20, 25, 50, 100, 200]
     .map(n => { const v = calcAvg(state.history, n); return v !== null ? `Avg${n}:$${v.toFixed(2)}` : null; })
     .filter(Boolean).join(' | ');
 
   const msg = [
     `${tierInfo.emoji} Total Value: $${totalUsd.toFixed(2)} [${tierInfo.name}]`,
-    `📍 Döngü: ${posInCycle}/${cycleSize} (~${remaining} kaldı) — Döngü Avg: $${cycleAvg.toFixed(2)}`,
+    `📦 ${seriesLine(tier)}`,
+    batchId !== null && s.current !== null && batchId !== s.current ? `🃏 Bu kart önceki seriden: #${batchId}` : null,
+    `🎰 Jackpot${batchId !== null ? ` (seri #${batchId})` : ''}: ${jackpotsHere}/${jackpotTotal}${isJackpot ? ' 🎉 JACKPOT!' : ''}`,
+    `📍 Seri Avg: $${seriesAvg.toFixed(2)} (${inSeries.length} claim)`,
     `🔴 Streak: ${state.streak}`,
-    `🎰 Jackpot: ${state.jackpotCycleCount}/${jackpotTotal}${isJackpot ? ' 🎉 JACKPOT!' : ''}`,
     avgLine ? `📊 ${avgLine}` : null,
     `👤 ${claimer}`,
     `🕐 ${date} | <a href="${txUrl}">TX</a>`,
   ].filter(Boolean).join('\n');
 
-  console.log(`[✓] ${tierInfo.name} $${totalUsd.toFixed(2)} ${posInCycle}/${cycleSize} #${claimedNftId}`);
+  console.log(`[✓] ${tierInfo.name} $${totalUsd.toFixed(2)} seri #${batchId} ${seriesLine(tier)} #${claimedNftId}`);
   await sendNotification(msg);
   return 'ok';
 }
@@ -1358,31 +1477,32 @@ async function pollLoop() {
 }
 
 function buildTierMsg(tierNum) {
-  const state     = ts(tierNum);
-  const tierInfo  = TIER_INFO[tierNum];
-  const cycleSize = getCycleSize(tierNum);
-  const pos       = state.sessionCount > 0 ? state.sessionCount : state.count;
-  if (!pos) return `${tierInfo.emoji} Henüz ${tierInfo.name} kaydı yok.`;
-  const posInCycle = ((pos - 1) % cycleSize) + 1;
-  const cycleSlice = state.history.slice(0, posInCycle);
-  const cycleAvg   = cycleSlice.reduce((s, c) => s + c.usd, 0) / (cycleSlice.length || 1);
-  const sEmoji     = state.streakDir === 'down' ? '🔴' : '🟢';
-  const avgLines   = [5, 10, 15, 20, 25, 50, 100, 200]
+  const state    = ts(tierNum);
+  const tierInfo = TIER_INFO[tierNum];
+  const s        = series[tierNum];
+  const inSeries = state.history.filter(h => h.batchId === s.current);
+  const seriesAvg = inSeries.reduce((a, h) => a + h.usd, 0) / (inSeries.length || 1);
+  const sEmoji   = state.streakDir === 'down' ? '🔴' : '🟢';
+  const avgLines = [5, 10, 15, 20, 25, 50, 100, 200]
     .map(n => { const v = calcAvg(state.history, n); return v !== null ? `Avg${n}: $${v.toFixed(2)}` : null; })
     .filter(Boolean).join('\n');
   return [
     `${tierInfo.emoji} <b>${tierInfo.name.toUpperCase()} İstatistikleri</b> ${VERSION}`,
     `($${tierInfo.payUsd} USDC paket)`,
     '',
-    `Toplam: ${pos}/${cycleSize}`,
-    `📍 Döngü: ${posInCycle}/${cycleSize} — Avg: $${cycleAvg.toFixed(2)}`,
+    `📦 ${seriesLine(tierNum)}`,
+    `🎰 Jackpot (seri #${s.current ?? '?'}): ${s.current !== null ? (s.jackpots.get(s.current) || 0) : 0}/${tierInfo.jackpotTotal}`,
+    `📍 Seri Avg: $${seriesAvg.toFixed(2)} (${inSeries.length} claim) | Toplam claim: ${state.count}`,
     `${sEmoji} Streak: ${state.streak}`,
     '',
     avgLines || 'Yetersiz veri',
   ].join('\n');
 }
 
-const TIERS_ORDER = [1, 2, 3];
+// One line per tier: current series and how many packages are left.
+function seriesSummary() {
+  return [1, 2, 3].map(t => `${TIER_INFO[t].emoji} ${TIER_INFO[t].name}: ${seriesLine(t)}`);
+}
 
 // Reminder shown on /start and /test until the chat is pinned via env var.
 function channelIdHint(chatId) {
@@ -1399,58 +1519,11 @@ async function startConversation(chatId) {
     '✅ Bu chat bildirim listesine eklendi.',
     channelIdHint(chatId),
     '',
-    '📊 Döngü Sayıcıları:',
-    `  • 🔵 mavi: Kaç tane açıldı? (?/${SC1_TARGET})`,
-    `  • 🟢 yeşil: Kaç tane açıldı? (?/${SC2_TARGET})`,
-    `  • 🟣 mor: Seri kaç paketlik? + Kaç tane açıldı?`,
-    '',
-    '💬 Sırayla cevapla',
+    '📦 Seriler (zincirden okunuyor, elle giriş yok):',
+    ...seriesSummary(),
+    seriesScan.done ? null : `⏳ Geçmiş sayım: ${seriesScan.status}`,
   ].filter(l => l !== null);
   await bot.sendMessage(chatId, lines.join('\n'), { parse_mode: 'HTML' });
-  conversations[chatId] = { step: 'tier1', data: {} };
-  await bot.sendMessage(chatId, `🔵 mavi: Kaç tane açıldı? (?/${SC1_TARGET})`);
-}
-
-async function handleConversationReply(chatId, text) {
-  const conv = conversations[chatId];
-  if (!conv) return;
-  const n = parseInt(text.trim(), 10);
-  if (isNaN(n) || n < 0 || n > 50000) {
-    await bot.sendMessage(chatId, '❌ Geçerli bir sayı girin (örn: 45)');
-    return;
-  }
-
-  if (conv.step === 'tier1') {
-    conv.data[1] = n;
-    conv.step = 'tier2';
-    await bot.sendMessage(chatId, `🟢 yeşil: Kaç tane açıldı? (?/${SC2_TARGET})`);
-  } else if (conv.step === 'tier2') {
-    conv.data[2] = n;
-    conv.step = 'mor_size';
-    await bot.sendMessage(chatId, `🟣 mor: Seri kaç paketlik? (varsayılan: ${sc3CycleOverride})`);
-  } else if (conv.step === 'mor_size') {
-    conv.data.sc3Size = n > 0 ? n : sc3CycleOverride;
-    conv.step = 'mor_opened';
-    await bot.sendMessage(chatId, `🟣 mor: Kaç tane açıldı? (?/${conv.data.sc3Size})`);
-  } else if (conv.step === 'mor_opened') {
-    conv.data[3] = n;
-    delete conversations[chatId];
-
-    ts(1).sessionCount = conv.data[1];
-    ts(2).sessionCount = conv.data[2];
-    sc3CycleOverride   = conv.data.sc3Size;
-    ts(3).sessionCount = conv.data[3];
-
-    const lines = ['✅ Döngü Sayıcıları Ayarlandı:'];
-    for (const t of TIERS_ORDER) {
-      const info = TIER_INFO[t];
-      const size = getCycleSize(t);
-      const avg  = overallAvg(t);
-      lines.push(`  • ${info.emoji} ${info.name}: ${ts(t).sessionCount}/${size} (ort: ${avg !== null ? '$'+avg.toFixed(2) : 'N/A'})`);
-    }
-    lines.push('', '💡 Yeni paket gelince sayıç otomatik ilerleyecek.');
-    await bot.sendMessage(chatId, lines.join('\n'), { parse_mode: 'HTML' });
-  }
 }
 
 async function main() {
@@ -1500,15 +1573,13 @@ async function main() {
     const lines = [
       `✅ <b>Test</b> ${VERSION}`,
       `📡 Kayıtlı chat: ${registeredChats.size} (bu chat: <code>${msg.chat.id}</code>)`,
-      `📇 NFT map: ${nftToTier.size} | Geçmiş tarama: ${tierScanStatus} (getLogs aralığı ${logsSpan})`,
-      `🗂 Son seri (batchId): mavi=${latestBatch[1] ?? '?'} yeşil=${latestBatch[2] ?? '?'} mor=${latestBatch[3] ?? '?'}`,
+      `📇 NFT map: ${nftToTier.size} | Sayılan kart: ${countedMints.size} | getLogs aralığı: ${logsSpan}`,
       `🔌 WebSocket: ${wsConnected ? '✅ aktif' : '❌ bağlı değil'} | RPC: ${rpcHost(RPCS[rpcIndex])}`,
       `⛓ Son taranan blok: ${stats.lastBlock || '-'}`,
       `🧾 Claim: ${stats.claims} | Gönderilen bildirim: ${stats.notified} | Kuyrukta: ${undelivered.length}`,
       `⏭ Atlanan — ücretsiz: ${stats.skipFree}, değer 0: ${stats.skipNoValue}, tier yok: ${stats.skipNoTier} | Retry kuyruğu: ${retryQueue.size}`,
-      `🔵 mavi (${SC1_TARGET}): ${ts(1).sessionCount}`,
-      `🟢 yeşil (${SC2_TARGET}): ${ts(2).sessionCount}`,
-      `🟣 mor (${sc3CycleOverride}): ${ts(3).sessionCount}`,
+      `📦 Seri sayımı: ${seriesScan.status}`,
+      ...seriesSummary(),
       channelIdHint(msg.chat.id),
     ].filter(l => l !== null);
     await bot.sendMessage(msg.chat.id, lines.join('\n'), { parse_mode: 'HTML' });
@@ -1538,13 +1609,6 @@ async function main() {
     await bot.sendMessage(chatId, report, { parse_mode: 'HTML', disable_web_page_preview: true });
   });
 
-  bot.on('message', (msg) => {
-    const text = (msg.text || '').trim();
-    if (text.startsWith('/')) return;
-    if (!conversations[msg.chat.id]) return;
-    handleConversationReply(msg.chat.id, text).catch(console.error);
-  });
-
   bot.on('polling_error', (e) => {
     if (e.message?.includes('409')) {
       pollingErrCount++;
@@ -1561,14 +1625,17 @@ async function main() {
     }
   });
 
-  console.log(`[${VERSION}] başladı | mavi=${SC1_TARGET} yeşil=${SC2_TARGET} mor=${sc3CycleOverride} | chat=${registeredChats.size} | state=${STATE_FILE}`);
+  console.log(`[${VERSION}] başladı | chat=${registeredChats.size} | state=${STATE_FILE}`);
   if (registeredChats.size === 0)
     console.log(`[UYARI] Kayıtlı chat yok — bildirimler kuyruğa alınacak. /start gönderin ve TELEGRAM_CHANNEL_ID ayarlayın.`);
 
   // Start WebSocket subscription for real-time events (poll loop is backup)
   startWsSubscription().catch(() => {});
-  // Warm the NFT→tier map from recent buys in the background.
-  ensureRecentTiers().catch(() => {});
+  // Count sold cards per series from chain history in the background.
+  scanSeriesHistory().catch(e => {
+    seriesScan.status = `hata: ${(e.message || '').slice(0, 80)}`;
+    console.error('[SERİ] tarama hatası:', e.message);
+  });
 
   lastPollBlock = 0;
   await pollLoop();
